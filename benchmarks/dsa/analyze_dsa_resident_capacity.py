@@ -295,7 +295,13 @@ def main() -> int:
         "--total-budget",
         type=int,
         default=None,
-        help="Optional total resident-token budget per worker process, allocated across observed layers",
+        help="Optional total resident-token budget per worker process, allocated across selected layers",
+    )
+    parser.add_argument(
+        "--allocation-scope",
+        choices=("target", "all"),
+        default="target",
+        help="Layers included in optional allocation: target only by default, or target plus MTP",
     )
     args = parser.parse_args()
 
@@ -344,8 +350,20 @@ def main() -> int:
 
     allocation_rows: list[dict[str, Any]] = []
     if args.total_budget is not None:
+        if args.allocation_scope == "target":
+            allocation_groups = {
+                key: value
+                for key, value in query_rows_by_group.items()
+                if not any(bool(record.get("is_mtp_layer")) for record in groups[key])
+            }
+        else:
+            allocation_groups = query_rows_by_group
+        allocation_keys = set(allocation_groups)
+        allocation_curves = {
+            key: value for key, value in capacity_curves.items() if key[:3] in allocation_keys
+        }
         allocation_rows = allocate_capacity(
-            query_rows_by_group, args.capacities, capacity_curves, args.total_budget
+            allocation_groups, args.capacities, allocation_curves, args.total_budget
         )
         _write_csv(output_dir / "capacity_allocation.csv", allocation_rows)
 
@@ -368,6 +386,7 @@ def main() -> int:
         }),
         "capacities_tokens_per_layer": args.capacities,
         "total_budget_tokens_per_process": args.total_budget,
+        "allocation_scope": args.allocation_scope if args.total_budget is not None else None,
         "allocation_row_count": len(allocation_rows),
         "simulator": {
             "name": "offline_ordered_lru",

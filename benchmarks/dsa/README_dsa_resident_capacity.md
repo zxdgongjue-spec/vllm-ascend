@@ -30,10 +30,10 @@ The observer is disabled unless VLLM_ASCEND_DSA_CAPACITY_TRACE_DIR is set before
    python benchmarks/dsa/request_dsa_capacity_trace.py --base-url http://127.0.0.1:8080 --model glm --input-tokens 12000 --output-tokens 64 --trace-dir /absolute/path/to/trace-dir
 6. Analyze:
    python benchmarks/dsa/analyze_dsa_resident_capacity.py --trace-dir /absolute/path/to/trace-dir --capacities 0,1024,2048,4096,6144,8192,10240,12288
-7. Optional candidate allocation, only after confirming the number of target and MTP layers:
-   python benchmarks/dsa/analyze_dsa_resident_capacity.py --trace-dir /absolute/path/to/trace-dir --capacities 0,1024,2048,4096,6144,8192,10240,12288 --total-budget 24576
+7. Optional candidate allocation, after confirming the target-layer count and the intended per-process budget:
+   python benchmarks/dsa/analyze_dsa_resident_capacity.py --trace-dir /absolute/path/to/trace-dir --capacities 0,1024,2048,4096,6144,8192,10240,12288 --total-budget 24576 --allocation-scope target
 
-The total budget is measured in raw index entries per worker process, not GiB. The optional allocation optimizes simulated hits on the captured trace only; it is a candidate for a later live experiment, not a runtime policy change.
+The 24576 example represents 4 target layers × 6144 entries; replace it if the target-layer count or budget differs. Allocation defaults to target layers only. Use --allocation-scope all only if you explicitly want MTP layers included. The budget is measured in raw index entries per worker process, not GiB. The optional allocation optimizes simulated hits on the captured trace only; it is a candidate for a later live experiment, not a runtime policy change.
 
 ## Expected outputs
 
