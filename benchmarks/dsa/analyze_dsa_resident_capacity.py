@@ -14,7 +14,6 @@ import argparse
 import csv
 import glob
 import json
-import math
 import statistics
 from collections import OrderedDict
 from pathlib import Path

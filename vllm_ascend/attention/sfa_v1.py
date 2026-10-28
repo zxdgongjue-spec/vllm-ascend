@@ -24,15 +24,15 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_capacity_observer import (
-    DSA_CAPACITY_TRACE_ENABLED,
-    observe_sfa_topk,
-)
 from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
+from vllm_ascend.attention.dsa_capacity_observer import (
+    DSA_CAPACITY_TRACE_ENABLED,
+    observe_sfa_topk,
+)
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
     SFA_QSFA_TILE_SIZE,
