@@ -24,6 +24,10 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_capacity_observer import (
+    DSA_CAPACITY_TRACE_ENABLED,
+    observe_sfa_topk,
+)
 from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
@@ -2086,6 +2090,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
         else:
             raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+
+        # Optional read-only trace of the exact raw TopK consumed by SFA.
+        # The default path is a single false branch; trace mode is eager-only.
+        if DSA_CAPACITY_TRACE_ENABLED and has_local_query:
+            observe_sfa_topk(
+                layer_name=layer_name,
+                topk_indices=topk_indices,
+                metadata=attn_metadata,
+                kv_cache=kv_cache,
+                is_mtp_layer=self._is_mtp_layer,
+                forward_context=get_forward_context(),
+            )
 
         # Notify for every layer that wrote the cache, not just indexer layers:
         # by this point all of the layer's KV (main + indexer) has been
