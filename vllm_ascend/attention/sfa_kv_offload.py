@@ -618,10 +618,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         layer_id = manager._get_offload_layer_id(layer_name)
         buffer_k = manager.topk_buffers_k[layer_id]
         buffer_v = manager.topk_buffers_v[layer_id]
-        pages_per_row = manager.topk_buffer_size // manager.block_size
+        resident_capacity = manager.get_layer_topk_buffer_size(layer_name)
+        pages_per_row = resident_capacity // manager.block_size
         resident_pages = rows * pages_per_row
         resident_k = buffer_k.reshape(-1, buffer_k.shape[-2], buffer_k.shape[-1])[
-            : rows * manager.topk_buffer_size
+            : rows * resident_capacity
         ].view(
             resident_pages,
             manager.block_size,
@@ -629,7 +630,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             buffer_k.shape[-1],
         )
         resident_v = buffer_v.reshape(-1, buffer_v.shape[-2], buffer_v.shape[-1])[
-            : rows * manager.topk_buffer_size
+            : rows * resident_capacity
         ].view(
             resident_pages,
             manager.block_size,
@@ -640,9 +641,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             resident_k,
             resident_v,
             manager.current_slots_npu[:rows],
-            manager.resident_block_table_npu[:rows],
+            manager.resident_block_table_npu_by_layer[layer_id][:rows],
             manager.resident_query_lens_npu[:rows],
-            manager.resident_seq_lens_npu[:rows],
+            manager.resident_seq_lens_npu_by_layer[layer_id][:rows],
         )
 
     def _offload_layer_name(self) -> str:
