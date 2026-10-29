@@ -1692,6 +1692,10 @@ class SparseKVOffloadConfig:
 
     enabled: bool = False
     topk_buffer_size: int = 4096
+    # Optional per-layer resident-capacity overrides. Unlisted layers keep the
+    # global topk_buffer_size. The first implementation supports the ordinary
+    # (non-fused) offload path only.
+    layer_topk_buffer_sizes: dict[str, int] = dataclasses.field(default_factory=dict)
     dram_size_per_dp_GB: int = 128
     keep_device_kv_cache: bool = False
     topk: int = dataclasses.field(default=0, init=False)
@@ -1714,7 +1718,32 @@ class SparseKVOffloadConfig:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be positive")
         if self.dram_size_per_dp_GB <= 0:
             raise ValueError("sparse_kv_offload_config.dram_size_per_dp_GB must be positive")
+        if self.layer_topk_buffer_sizes:
+            if not self.enabled:
+                raise ValueError(
+                    "sparse_kv_offload_config.layer_topk_buffer_sizes requires enabled=true"
+                )
+            if self.use_fused_overlap or self.use_fused_copy_sfa:
+                raise ValueError(
+                    "per-layer resident capacities currently support only the non-fused "
+                    "Sparse KV offload path"
+                )
+            for layer_name, capacity in self.layer_topk_buffer_sizes.items():
+                if not layer_name.strip():
+                    raise ValueError("layer_topk_buffer_sizes keys must be non-empty layer names")
+                if capacity < self.topk_buffer_size:
+                    raise ValueError(
+                        "per-layer resident-capacity overrides are expansion-only: "
+                        f"layer={layer_name!r}, capacity={capacity}, "
+                        f"baseline={self.topk_buffer_size}"
+                    )
         return self
+
+    def capacity_for_layer(self, layer_name: str | None = None) -> int:
+        """Return the static resident capacity for one layer."""
+        if layer_name is None:
+            return self.topk_buffer_size
+        return self.layer_topk_buffer_sizes.get(layer_name, self.topk_buffer_size)
 
     @classmethod
     def from_additional_config(cls, vllm_config: VllmConfig, user_config: Any) -> SparseKVOffloadConfig:
@@ -1767,6 +1796,19 @@ class SparseKVOffloadConfig:
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "
                 f"got topk_buffer_size={self.topk_buffer_size}, topk={self.topk}"
             )
+        if self.layer_topk_buffer_sizes:
+            block_size = int(vllm_config.cache_config.block_size)
+            for layer_name, capacity in self.layer_topk_buffer_sizes.items():
+                if capacity < self.topk:
+                    raise ValueError(
+                        "per-layer resident capacity must be >= model TopK: "
+                        f"layer={layer_name!r}, capacity={capacity}, topk={self.topk}"
+                    )
+                if capacity % block_size:
+                    raise ValueError(
+                        "per-layer resident capacity must be divisible by cache block_size: "
+                        f"layer={layer_name!r}, capacity={capacity}, block_size={block_size}"
+                    )
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
