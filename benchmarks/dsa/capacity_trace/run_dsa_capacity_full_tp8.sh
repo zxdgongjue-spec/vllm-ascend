@@ -10,6 +10,9 @@ PY=/usr/local/python3.12.13/bin/python
 
 cd "$REPO"
 
+# Ensure imports and runtime code resolve to this checkout.
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+
 TRACE_SCRIPT=benchmarks/dsa/capacity_trace/run_dsa_capacity_trace.sh
 REQUEST_SCRIPT=benchmarks/dsa/capacity_trace/request_dsa_capacity_trace.py
 ANALYZER_SCRIPT=benchmarks/dsa/analyze_dsa_resident_capacity.py
@@ -90,6 +93,8 @@ export PROMETHEUS_MULTIPROC_DIR=/dev/shm/vllm_metrics
 mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
 
 export HCCL_DFS_CONFIG="task_exception:off,inconsistent_check:off"
+# Keep this intentionally disabled even if the parent shell exported it.
+unset HCCL_IF_IP
 # TEMP_DISABLED: export HCCL_IF_IP="$LOCAL_IP"
 export GLOO_SOCKET_IFNAME="$NIC_NAME"
 export TP_SOCKET_IFNAME="$NIC_NAME"
@@ -111,7 +116,7 @@ echo "TP=8"
 echo "OBSERVATION_ONLY=1"
 echo "TASK_QUEUE_ENABLE=$TASK_QUEUE_ENABLE"
 echo "ASYNC_SCHEDULING=not-enabled-by-this-script"
-echo "HCCL_IF_IP=unset-by-this-script"
+echo "HCCL_IF_IP=${HCCL_IF_IP-<unset>}"
 
 # 5. Start the full model in eager mode for observation. Do not use this run
 #    for performance comparisons; trace mode copies TopK data to host.
