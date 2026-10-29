@@ -177,6 +177,7 @@ nohup vllm serve "$MODEL" \
   --no-enable-prefix-caching \
   --gpu-memory-utilization 0.95 \
   --quantization ascend \
+  --dtype bfloat16 \
   --enforce-eager \
   --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}' \
   --attention_config.indexer_kv_dtype fp8 \
