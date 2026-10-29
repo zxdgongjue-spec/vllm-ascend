@@ -57,10 +57,11 @@ def test_group_with_padding_but_valid_indices_remains_usable():
         [{"is_mtp_layer": False}],
         [_query_row([10, -1, 20])],
     )
-    assert summary["analysis_status"] == "VALID_WITH_PADDING"
+    assert summary["analysis_status"] == "VALID_WITH_NEGATIVE_INDICES"
     assert summary["analysis_usable"] is True
     assert summary["raw_valid_topk_items"] == 2
     assert summary["negative_padding_items"] == 1
+    assert summary["negative_index_items"] == 1
 
 
 def test_main_blanks_invalid_capacity_curves_and_excludes_allocation(tmp_path, monkeypatch):
@@ -109,3 +110,41 @@ def test_main_blanks_invalid_capacity_curves_and_excludes_allocation(tmp_path, m
     allocation_path = trace_dir / "capacity_allocation.csv"
     assert allocation_path.exists()
     assert allocation_path.read_text(encoding="utf-8") == ""
+
+
+
+def test_main_marks_negative_index_semantics_as_partial_quality(tmp_path, monkeypatch):
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    record = {
+        "kind": "topk_trace",
+        "trace_seq": 0,
+        "pid": 124,
+        "rank": "0",
+        "layer_name": "model.layers.1.self_attn",
+        "is_mtp_layer": False,
+        "topk_indices": [[10, -1, 20]],
+        "seq_lens": [12000],
+        "positions": [11999],
+        "query_start_loc": [0, 1],
+        "block_size": 128,
+    }
+    (trace_dir / "topk_trace_rank0_pid124.jsonl").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "analyze_dsa_resident_capacity.py",
+            "--trace-dir",
+            str(trace_dir),
+            "--capacities",
+            "0,1",
+        ],
+    )
+
+    assert analysis.main() == 0
+    summary = json.loads((trace_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["data_quality_status"] == "PARTIAL"
+    assert summary["negative_index_item_count"] == 1
+    assert any("Their semantics are not inferred" in warning for warning in summary["warnings"])

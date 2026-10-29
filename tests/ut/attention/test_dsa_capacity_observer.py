@@ -84,8 +84,8 @@ def test_observer_writes_decode_record(tmp_path, monkeypatch):
     assert record["topk_indices"] == [[1, 2, -1], [2, 3, -1]]
     assert record["topk_item_count"] == 6
     assert record["valid_topk_items"] == 4
-    assert record["negative_padding_items"] == 2
-    assert record["negative_padding_fraction"] == 2 / 6
+    assert record["negative_index_items"] == 2
+    assert record["negative_index_fraction"] == 2 / 6
     assert record["valid_topk_rows"] == 2
     assert record["rows_without_valid_topk"] == 0
     assert record["seq_lens"] == [10]

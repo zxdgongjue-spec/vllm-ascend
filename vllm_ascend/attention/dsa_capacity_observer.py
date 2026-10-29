@@ -282,8 +282,8 @@ def observe_sfa_topk(
             "topk_width": max((len(row) for row in rows), default=0),
             "topk_item_count": topk_item_count,
             "valid_topk_items": valid_topk_items,
-            "negative_padding_items": negative_padding_items,
-            "negative_padding_fraction": (
+            "negative_index_items": negative_padding_items,
+            "negative_index_fraction": (
                 negative_padding_items / topk_item_count if topk_item_count else 0.0
             ),
             "valid_topk_rows": valid_topk_rows,

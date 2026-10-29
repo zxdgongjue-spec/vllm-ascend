@@ -202,7 +202,7 @@ def _summarize_group(
     elif rows_without_valid_topk:
         analysis_status = "PARTIAL_NO_VALID_ROWS"
     elif negative_padding_items:
-        analysis_status = "VALID_WITH_PADDING"
+        analysis_status = "VALID_WITH_NEGATIVE_INDICES"
     else:
         analysis_status = "VALID"
     max_index = max(indices) if indices else None
@@ -222,7 +222,11 @@ def _summarize_group(
         "unique_accesses": sum(unique_per_query),
         "duplicate_topk_items": len(indices) - sum(unique_per_query),
         "negative_padding_items": negative_padding_items,
+        "negative_index_items": negative_padding_items,
         "negative_padding_fraction": (
+            negative_padding_items / topk_item_count if topk_item_count else 0.0
+        ),
+        "negative_index_fraction": (
             negative_padding_items / topk_item_count if topk_item_count else 0.0
         ),
         "analysis_usable": analysis_usable,
@@ -383,6 +387,7 @@ def main() -> int:
                 "analysis_status": group_summary["analysis_status"],
                 "valid_topk_items": group_summary["raw_valid_topk_items"],
                 "negative_padding_items": group_summary["negative_padding_items"],
+                "negative_index_items": group_summary["negative_index_items"],
                 **metrics,
             }
             curve_rows.append(curve)
@@ -430,7 +435,7 @@ def main() -> int:
     )
     if valid_topk_item_count == 0:
         data_quality_status = "FAIL"
-    elif unusable_group_count:
+    elif unusable_group_count or negative_padding_item_count:
         data_quality_status = "PARTIAL"
     else:
         data_quality_status = "PASS"
@@ -446,6 +451,12 @@ def main() -> int:
             f"{unusable_group_count} rank/PID/layer groups contain query rows without valid TopK indices; "
             "their capacity curves are blank and they are excluded from capacity allocation."
         )
+    if negative_padding_item_count:
+        warnings.append(
+            f"{negative_padding_item_count} negative TopK index entries were excluded from LRU simulation. "
+            "Their semantics are not inferred; confirm whether they are padding or rank/CP sentinels "
+            "before making a final capacity decision."
+        )
     if valid_topk_item_count == 0:
         warnings.append("No valid TopK indices were observed; do not draw capacity conclusions from this trace.")
 
@@ -455,7 +466,11 @@ def main() -> int:
         "valid_topk_item_count": valid_topk_item_count,
         "topk_item_count": topk_item_count,
         "negative_padding_item_count": negative_padding_item_count,
+        "negative_index_item_count": negative_padding_item_count,
         "negative_padding_fraction": (
+            negative_padding_item_count / topk_item_count if topk_item_count else 0.0
+        ),
+        "negative_index_fraction": (
             negative_padding_item_count / topk_item_count if topk_item_count else 0.0
         ),
         "groups_with_negative_padding_count": groups_with_negative_padding_count,
