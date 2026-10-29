@@ -82,6 +82,12 @@ def test_observer_writes_decode_record(tmp_path, monkeypatch):
     record = json.loads(trace_files[0].read_text(encoding="utf-8").splitlines()[0])
     assert record["kind"] == "topk_trace"
     assert record["topk_indices"] == [[1, 2, -1], [2, 3, -1]]
+    assert record["topk_item_count"] == 6
+    assert record["valid_topk_items"] == 4
+    assert record["negative_padding_items"] == 2
+    assert record["negative_padding_fraction"] == 2 / 6
+    assert record["valid_topk_rows"] == 2
+    assert record["rows_without_valid_topk"] == 0
     assert record["seq_lens"] == [10]
     assert record["positions"] == [8, 9]
     assert record["block_size"] == 16
@@ -108,3 +114,19 @@ def test_observer_skips_prefill(tmp_path, monkeypatch):
         metadata=metadata,
     )
     assert list(tmp_path.glob("topk_trace_rank*_pid*.jsonl")) == []
+
+
+
+def test_rank_label_prefers_initialized_distributed_rank(monkeypatch):
+    for name in ("RANK", "RANK_ID", "LOCAL_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(observer, "_distributed_rank_label", lambda: "7")
+    assert observer._rank_label() == "7"
+
+
+def test_rank_label_falls_back_to_local_rank(monkeypatch):
+    monkeypatch.setattr(observer, "_distributed_rank_label", lambda: None)
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("RANK_ID", raising=False)
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    assert observer._rank_label() == "3"

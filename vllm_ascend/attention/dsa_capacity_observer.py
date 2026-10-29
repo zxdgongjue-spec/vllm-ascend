@@ -126,11 +126,32 @@ def _cache_metadata(kv_cache: Any) -> list[dict[str, Any] | None]:
     return [_tensor_metadata(tensor) for tensor in tensors]
 
 
+def _distributed_rank_label() -> str | None:
+    """Return the initialized process group's global rank, if available."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        # Rank discovery is diagnostic only and must never affect inference.
+        pass
+    return None
+
+
 def _rank_label() -> str:
-    for name in ("RANK", "RANK_ID", "LOCAL_RANK"):
+    rank = _distributed_rank_label()
+    if rank is not None and rank.strip():
+        return rank.strip().replace("/", "_")
+
+    for name in ("RANK", "RANK_ID"):
         value = os.environ.get(name)
         if value is not None and value.strip():
             return value.strip().replace("/", "_")
+
+    value = os.environ.get("LOCAL_RANK")
+    if value is not None and value.strip():
+        return value.strip().replace("/", "_")
     return "unknown"
 
 
@@ -237,6 +258,12 @@ def observe_sfa_topk(
         seq_lens = [int(value) for value in seq_lens]
 
         block_size = _safe_int(getattr(metadata, "block_size", 0))
+        topk_item_count = sum(len(row) for row in rows)
+        valid_topk_items = sum(1 for row in rows for value in row if value >= 0)
+        negative_padding_items = topk_item_count - valid_topk_items
+        valid_topk_rows = sum(1 for row in rows if any(value >= 0 for value in row))
+        rows_without_valid_topk = len(rows) - valid_topk_rows
+
         record = {
             "schema_version": 1,
             "kind": "topk_trace",
@@ -253,6 +280,14 @@ def observe_sfa_topk(
             "num_actual_tokens": num_actual_tokens,
             "num_query_rows": len(rows),
             "topk_width": max((len(row) for row in rows), default=0),
+            "topk_item_count": topk_item_count,
+            "valid_topk_items": valid_topk_items,
+            "negative_padding_items": negative_padding_items,
+            "negative_padding_fraction": (
+                negative_padding_items / topk_item_count if topk_item_count else 0.0
+            ),
+            "valid_topk_rows": valid_topk_rows,
+            "rows_without_valid_topk": rows_without_valid_topk,
             "topk_indices": rows,
             "seq_lens": seq_lens,
             "positions": positions,

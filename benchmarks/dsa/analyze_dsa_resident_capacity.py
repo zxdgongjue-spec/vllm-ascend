@@ -190,6 +190,21 @@ def _summarize_group(
     block_sizes = sorted({
         int(row["block_size"]) for row in query_rows if int(row["block_size"]) > 0
     })
+    topk_item_count = sum(len(row["indices"]) for row in query_rows)
+    negative_padding_items = topk_item_count - len(indices)
+    valid_topk_rows = sum(
+        1 for row in query_rows if any(int(token_id) >= 0 for token_id in row["indices"])
+    )
+    rows_without_valid_topk = len(query_rows) - valid_topk_rows
+    analysis_usable = bool(indices) and rows_without_valid_topk == 0
+    if not indices:
+        analysis_status = "NO_VALID_TOPK"
+    elif rows_without_valid_topk:
+        analysis_status = "PARTIAL_NO_VALID_ROWS"
+    elif negative_padding_items:
+        analysis_status = "VALID_WITH_PADDING"
+    else:
+        analysis_status = "VALID"
     max_index = max(indices) if indices else None
     max_seq_len = max(seq_lens) if seq_lens else None
     return {
@@ -200,12 +215,18 @@ def _summarize_group(
         "trace_records": len(records),
         "query_rows": len(query_rows),
         "topk_width_max": max((len(row["indices"]) for row in query_rows), default=0),
+        "topk_item_count": topk_item_count,
         "raw_valid_topk_items": len(indices),
+        "valid_topk_rows": valid_topk_rows,
+        "rows_without_valid_topk": rows_without_valid_topk,
         "unique_accesses": sum(unique_per_query),
         "duplicate_topk_items": len(indices) - sum(unique_per_query),
-        "negative_padding_items": sum(
-            1 for row in query_rows for token_id in row["indices"] if int(token_id) < 0
+        "negative_padding_items": negative_padding_items,
+        "negative_padding_fraction": (
+            negative_padding_items / topk_item_count if topk_item_count else 0.0
         ),
+        "analysis_usable": analysis_usable,
+        "analysis_status": analysis_status,
         "mean_unique_selected_per_query": (
             statistics.mean(unique_per_query) if unique_per_query else 0.0
         ),
@@ -320,6 +341,7 @@ def main() -> int:
     query_rows_by_group: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     curve_rows: list[dict[str, Any]] = []
     capacity_curves: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    analysis_usable_by_group: dict[tuple[str, str, str], bool] = {}
 
     for key, group_records in sorted(groups.items()):
         group_records.sort(key=lambda item: int(item.get("trace_seq") or 0))
@@ -329,10 +351,27 @@ def main() -> int:
             for row in record_to_query_rows(record)
         ]
         query_rows_by_group[key] = query_rows
-        layer_rows.append(_summarize_group(*key, group_records, query_rows))
+        group_summary = _summarize_group(*key, group_records, query_rows)
+        layer_rows.append(group_summary)
+        analysis_usable = bool(group_summary["analysis_usable"])
+        analysis_usable_by_group[key] = analysis_usable
         raw_rows = [row["indices"] for row in query_rows]
         for capacity in args.capacities:
-            metrics = simulate_lru(raw_rows, capacity)
+            if analysis_usable:
+                metrics = simulate_lru(raw_rows, capacity)
+            else:
+                # Blank metrics prevent invalid traces from masquerading as
+                # zero-miss/zero-access evidence in downstream spreadsheets.
+                metrics = {
+                    "accesses": None,
+                    "hits": None,
+                    "misses": None,
+                    "hit_rate": None,
+                    "miss_rate": None,
+                    "misses_per_query": None,
+                    "final_resident_entries": None,
+                    "duplicate_within_query": None,
+                }
             curve = {
                 "rank": key[0],
                 "pid": key[1],
@@ -340,6 +379,10 @@ def main() -> int:
                 "is_mtp_layer": any(bool(record.get("is_mtp_layer")) for record in group_records),
                 "capacity_tokens": capacity,
                 "query_rows": len(raw_rows),
+                "analysis_usable": analysis_usable,
+                "analysis_status": group_summary["analysis_status"],
+                "valid_topk_items": group_summary["raw_valid_topk_items"],
+                "negative_padding_items": group_summary["negative_padding_items"],
                 **metrics,
             }
             curve_rows.append(curve)
@@ -354,10 +397,15 @@ def main() -> int:
             allocation_groups = {
                 key: value
                 for key, value in query_rows_by_group.items()
-                if not any(bool(record.get("is_mtp_layer")) for record in groups[key])
+                if analysis_usable_by_group.get(key, False)
+                and not any(bool(record.get("is_mtp_layer")) for record in groups[key])
             }
         else:
-            allocation_groups = query_rows_by_group
+            allocation_groups = {
+                key: value
+                for key, value in query_rows_by_group.items()
+                if analysis_usable_by_group.get(key, False)
+            }
         allocation_keys = set(allocation_groups)
         allocation_curves = {
             key: value for key, value in capacity_curves.items() if key[:3] in allocation_keys
@@ -367,8 +415,53 @@ def main() -> int:
         )
         _write_csv(output_dir / "capacity_allocation.csv", allocation_rows)
 
+    valid_topk_item_count = sum(int(row["raw_valid_topk_items"]) for row in layer_rows)
+    negative_padding_item_count = sum(int(row["negative_padding_items"]) for row in layer_rows)
+    topk_item_count = sum(int(row["topk_item_count"]) for row in layer_rows)
+    unusable_group_count = sum(1 for row in layer_rows if not row["analysis_usable"])
+    no_valid_topk_group_count = sum(
+        1 for row in layer_rows if row["analysis_status"] == "NO_VALID_TOPK"
+    )
+    partial_no_valid_rows_group_count = sum(
+        1 for row in layer_rows if row["analysis_status"] == "PARTIAL_NO_VALID_ROWS"
+    )
+    groups_with_negative_padding_count = sum(
+        1 for row in layer_rows if int(row["negative_padding_items"]) > 0
+    )
+    if valid_topk_item_count == 0:
+        data_quality_status = "FAIL"
+    elif unusable_group_count:
+        data_quality_status = "PARTIAL"
+    else:
+        data_quality_status = "PASS"
+
+    warnings = [
+        "This is a trace-driven LRU estimate, not a measurement of live resident-cache hits or offload misses.",
+        "Validate that raw SFA TopK indices represent the token identity domain intended for capacity simulation.",
+        "If target and MTP layers differ, use layer_report.csv to separate them before making a capacity decision.",
+        "Observation mode copies indices to CPU and writes JSONL; do not use its latency as the performance baseline.",
+    ]
+    if unusable_group_count:
+        warnings.append(
+            f"{unusable_group_count} rank/PID/layer groups contain query rows without valid TopK indices; "
+            "their capacity curves are blank and they are excluded from capacity allocation."
+        )
+    if valid_topk_item_count == 0:
+        warnings.append("No valid TopK indices were observed; do not draw capacity conclusions from this trace.")
+
     summary = {
         "schema_version": 1,
+        "data_quality_status": data_quality_status,
+        "valid_topk_item_count": valid_topk_item_count,
+        "topk_item_count": topk_item_count,
+        "negative_padding_item_count": negative_padding_item_count,
+        "negative_padding_fraction": (
+            negative_padding_item_count / topk_item_count if topk_item_count else 0.0
+        ),
+        "groups_with_negative_padding_count": groups_with_negative_padding_count,
+        "unusable_capacity_group_count": unusable_group_count,
+        "groups_without_valid_topk_count": no_valid_topk_group_count,
+        "groups_with_rows_without_valid_topk_count": partial_no_valid_rows_group_count,
         "trace_dir": str(trace_dir),
         "trace_files": [Path(path).name for path in trace_files],
         "trace_file_count": len(trace_files),
@@ -397,18 +490,16 @@ def main() -> int:
             "physical_hbm_bytes_measured": False,
             "tpot_measured": False,
         },
-        "warnings": [
-            "This is a trace-driven LRU estimate, not a measurement of live resident-cache hits or offload misses.",
-            "Validate that raw SFA TopK indices represent the token identity domain intended for capacity simulation.",
-            "If target and MTP layers differ, use layer_report.csv to separate them before making a capacity decision.",
-            "Observation mode copies indices to CPU and writes JSONL; do not use its latency as the performance baseline.",
-        ],
+        "warnings": warnings,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     print(json.dumps({
         "status": "PASS",
+        "data_quality_status": data_quality_status,
+        "usable_capacity_groups": len(groups) - unusable_group_count,
+        "unusable_capacity_groups": unusable_group_count,
         "trace_files": len(trace_files),
         "records": len(records),
         "rank_pid_layer_groups": len(groups),
