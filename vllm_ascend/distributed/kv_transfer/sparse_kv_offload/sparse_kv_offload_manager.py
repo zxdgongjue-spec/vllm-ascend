@@ -109,12 +109,18 @@ def _sparse_kv_ops():
 def allocate_kv_offload_topk_buffer_pair(
     vllm_config: VllmConfig,
     sparse_kv_offload_config: SparseKVOffloadConfig,
+    layer_name: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     decode_width = 1
     if vllm_config.speculative_config is not None:
         decode_width += vllm_config.speculative_config.num_speculative_tokens
 
-    topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
+    capacity_for_layer = getattr(sparse_kv_offload_config, "capacity_for_layer", None)
+    topk_buffer_size = (
+        capacity_for_layer(layer_name)
+        if callable(capacity_for_layer)
+        else sparse_kv_offload_config.topk_buffer_size
+    )
     num_kv_heads = 1  # sparse kv offload only support sfa(mla) now.
     k_dim = vllm_config.model_config.hf_text_config.kv_lora_rank
     v_dim = vllm_config.model_config.hf_text_config.qk_rope_head_dim
@@ -164,12 +170,19 @@ def allocate_kv_offload_topk_profile_buffers(
     vllm_config: VllmConfig,
     sparse_kv_offload_config: SparseKVOffloadConfig,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    num_offload_layers = sum(bool(getattr(spec, "store_on_host", False)) for spec in kv_cache_spec.values())
-    if num_offload_layers == 0:
+    offload_layer_names = [
+        layer_name
+        for layer_name, spec in kv_cache_spec.items()
+        if bool(getattr(spec, "store_on_host", False))
+    ]
+    if not offload_layer_names:
         raise RuntimeError("Sparse KV offload profile did not find any host-resident SFA KV cache layers.")
 
     buffers = [
-        allocate_kv_offload_topk_buffer_pair(vllm_config, sparse_kv_offload_config) for _ in range(num_offload_layers)
+        allocate_kv_offload_topk_buffer_pair(
+            vllm_config, sparse_kv_offload_config, layer_name=layer_name
+        )
+        for layer_name in offload_layer_names
     ]
     buffer_bytes = sum(tensor.numel() * tensor.element_size() for buffer_pair in buffers for tensor in buffer_pair)
     logger.info_once(
@@ -374,6 +387,7 @@ def reshape_kv_cache_tensors_for_sparse_kv_offload(
     tp_rank: int,
     vllm_config: VllmConfig,
     sparse_kv_offload_config: SparseKVOffloadConfig,
+    layer_name: str | None = None,
 ):
     raw_k_tensor, raw_v_tensor, raw_k_tensor_cpu, raw_v_tensor_cpu, sum_page_size_bytes = raw_cache_tensors
     assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
@@ -411,7 +425,9 @@ def reshape_kv_cache_tensors_for_sparse_kv_offload(
         k_cache_cpu = None
         v_cache_cpu = None
 
-    topk_buffer_k, topk_buffer_v = allocate_kv_offload_topk_buffer_pair(vllm_config, sparse_kv_offload_config)
+    topk_buffer_k, topk_buffer_v = allocate_kv_offload_topk_buffer_pair(
+        vllm_config, sparse_kv_offload_config, layer_name=layer_name
+    )
     return (k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v)
 
 
@@ -517,6 +533,8 @@ class SparseKVOffloadManager:
         self.tp_group = get_tp_group()
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
+        self.layer_topk_buffer_sizes: dict[str, int] = {}
+        self.layer_topk_buffer_sizes_by_id: list[int] = []
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
         self.use_fused_copy_sfa = sparse_kv_offload_config.use_fused_copy_sfa
@@ -638,6 +656,11 @@ class SparseKVOffloadManager:
             if len(self.offload_layer_names) > 4:
                 preview_layer_names += ["..."] + self.offload_layer_names[-4:]
             logger.info("Sparse KV offload layer names: %s", preview_layer_names)
+
+    def get_layer_topk_buffer_size(self, layer_name: str) -> int:
+        """Return the configured resident capacity for a registered layer."""
+        layer_id = self._get_offload_layer_id(layer_name)
+        return self.layer_topk_buffer_sizes_by_id[layer_id]
 
     def _get_offload_layer_id(self, layer_name: str) -> int:
         layer_id = self.layer_name_to_offload_id.get(layer_name)
@@ -768,6 +791,45 @@ class SparseKVOffloadManager:
     ):
         self._register_offload_layers(kv_caches)
 
+        configured_overrides = set(self.sparse_kv_offload_config.layer_topk_buffer_sizes)
+        unknown_overrides = configured_overrides.difference(self.offload_layer_names)
+        if unknown_overrides:
+            raise ValueError(
+                "sparse_kv_offload_config.layer_topk_buffer_sizes contains layers "
+                "that are not registered for sparse KV offload: "
+                + ", ".join(sorted(unknown_overrides))
+            )
+        self.layer_topk_buffer_sizes = {
+            layer_name: int(self.sparse_kv_offload_config.capacity_for_layer(layer_name))
+            for layer_name in self.offload_layer_names
+        }
+        self.layer_topk_buffer_sizes_by_id = [
+            self.layer_topk_buffer_sizes[layer_name] for layer_name in self.offload_layer_names
+        ]
+        self.topk_buffer_size = max(
+            self.layer_topk_buffer_sizes_by_id,
+            default=self.sparse_kv_offload_config.topk_buffer_size,
+        )
+        invalid_capacities = [
+            (layer_name, capacity)
+            for layer_name, capacity in self.layer_topk_buffer_sizes.items()
+            if capacity % self.block_size
+        ]
+        if invalid_capacities:
+            layer_name, capacity = invalid_capacities[0]
+            raise ValueError(
+                "Sparse KV offload per-layer resident capacity must be divisible by "
+                f"block_size ({self.block_size}); layer={layer_name}, capacity={capacity}"
+            )
+        logger.info(
+            "DSA_LAYER_RESIDENT_CAPACITY: default=%s, overrides=%s",
+            self.sparse_kv_offload_config.topk_buffer_size,
+            {
+                name: self.layer_topk_buffer_sizes[name]
+                for name in sorted(configured_overrides)
+            },
+        )
+
         # register topk_buffer and cpu kv_cache
         self.topk_buffers_k: list[torch.Tensor] = []
         self.topk_buffers_v: list[torch.Tensor] = []
@@ -799,11 +861,8 @@ class SparseKVOffloadManager:
             )
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
-        if self.topk_buffer_size % self.block_size != 0:
-            raise ValueError(
-                "Sparse KV offload topk_buffer_size must be divisible by "
-                f"block_size, got {self.topk_buffer_size} and {self.block_size}"
-            )
+        # Every per-layer capacity was validated before allocating the
+        # persistent resident views and LRU slot tables.
 
         # D2H uses a separate descriptor set from the shared H2D buffers below.
         # Both prefill (colocate debug only, gated by keep_device_kv_cache)
@@ -845,6 +904,27 @@ class SparseKVOffloadManager:
             dtype=torch.int32,
             device=device,
         )
+        # Per-layer tables must use that layer's physical row stride. Slicing
+        # the max-capacity table would produce wrong page IDs for smaller rows.
+        self.resident_block_table_npu_by_layer = []
+        self.resident_seq_lens_npu_by_layer = []
+        for capacity in self.layer_topk_buffer_sizes_by_id:
+            layer_pages_per_row = capacity // self.block_size
+            self.resident_block_table_npu_by_layer.append(
+                torch.arange(
+                    self.max_num_topk_rows * layer_pages_per_row,
+                    dtype=torch.int32,
+                    device=device,
+                ).view(self.max_num_topk_rows, layer_pages_per_row)
+            )
+            self.resident_seq_lens_npu_by_layer.append(
+                torch.full(
+                    (self.max_num_topk_rows,),
+                    capacity,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
 
         # sparse_copy related addrs and buffers
         self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
@@ -971,24 +1051,24 @@ class SparseKVOffloadManager:
         )
         self.lru_slot_to_token_cpu_list = [
             torch.full(
-                [self.max_num_topk_rows, self.topk_buffer_size],
+                [self.max_num_topk_rows, capacity],
                 -1,
                 dtype=torch.int32,
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(self.num_layers)
+            for capacity in self.layer_topk_buffer_sizes_by_id
         ]
         self.lru_slots_cpu_list = [
             torch.arange(
-                self.topk_buffer_size,
+                capacity,
                 dtype=torch.int32,
                 device="cpu",
             )
             .view(1, -1)
             .repeat(self.max_num_topk_rows, 1)
             .pin_memory()
-            for _ in range(self.num_layers)
+            for capacity in self.layer_topk_buffer_sizes_by_id
         ]
         self.lru_current_slots_cpu = torch.empty(
             [self.max_num_topk_rows, self.topk],
@@ -1554,7 +1634,7 @@ class SparseKVOffloadManager:
                 encoded_plan_stride,
                 num_tokens,
                 self.topk,
-                self.topk_buffer_size,
+                self.layer_topk_buffer_sizes_by_id[layer_id],
                 self.max_model_len,
                 self.lru_workspace_threads,
                 self.lru_workspace_threads,
@@ -1754,7 +1834,7 @@ class SparseKVOffloadManager:
             lru_epochs_ptr,
             num_reqs,
             self.topk,
-            self.topk_buffer_size,
+            self.layer_topk_buffer_sizes_by_id[layer_id],
             self.max_model_len,
             self.lru_workspace_threads,
             self.lru_workspace_threads,
@@ -1771,7 +1851,7 @@ class SparseKVOffloadManager:
             gvas_v_bases,
             addr_k_bases,
             addr_v_bases,
-            self.topk_buffer_size,
+            self.layer_topk_buffer_sizes_by_id[layer_id],
             self.lru_workspace_threads,
             gvas_buffer,
             addr_buffer,
