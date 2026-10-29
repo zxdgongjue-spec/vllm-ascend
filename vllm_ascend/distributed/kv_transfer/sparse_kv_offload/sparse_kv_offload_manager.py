@@ -791,7 +791,8 @@ class SparseKVOffloadManager:
     ):
         self._register_offload_layers(kv_caches)
 
-        configured_overrides = set(self.sparse_kv_offload_config.layer_topk_buffer_sizes)
+        configured_override_map = getattr(self.sparse_kv_offload_config, "layer_topk_buffer_sizes", {}) or {}
+        configured_overrides = set(configured_override_map)
         unknown_overrides = configured_overrides.difference(self.offload_layer_names)
         if unknown_overrides:
             raise ValueError(
@@ -799,8 +800,13 @@ class SparseKVOffloadManager:
                 "that are not registered for sparse KV offload: "
                 + ", ".join(sorted(unknown_overrides))
             )
+        capacity_for_layer = getattr(self.sparse_kv_offload_config, "capacity_for_layer", None)
         self.layer_topk_buffer_sizes = {
-            layer_name: int(self.sparse_kv_offload_config.capacity_for_layer(layer_name))
+            layer_name: int(
+                capacity_for_layer(layer_name)
+                if callable(capacity_for_layer)
+                else self.sparse_kv_offload_config.topk_buffer_size
+            )
             for layer_name in self.offload_layer_names
         }
         self.layer_topk_buffer_sizes_by_id = [
