@@ -29,6 +29,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.dsa_capacity_observer import DSA_CAPACITY_TRACE_ENABLED
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     build_sfa_dcp_replicated_block_table,
     build_sfa_dcp_replicated_slot_mapping,
@@ -1111,7 +1112,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         self._mask_lim_slot_mapping(common_attn_metadata, slot_mapping, buffer_key)
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
         query_positions = input_positions
-        if self.use_dsa_cp and not self.use_pcp:
+        if DSA_CAPACITY_TRACE_ENABLED and self.use_dsa_cp and not self.use_pcp:
             # DSA-CP shards the token rows across TP and pads the final shard.
             # Keep the real positions for this rank aligned with local TopK rows.
             num_tokens_pad = _round_up(num_input_tokens, self.dsa_cp_world_size)
