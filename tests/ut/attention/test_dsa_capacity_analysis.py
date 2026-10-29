@@ -80,7 +80,7 @@ def test_main_blanks_invalid_capacity_curves_and_excludes_allocation(tmp_path, m
         "block_size": 128,
     }
     (trace_dir / "topk_trace_rank0_pid123.jsonl").write_text(
-        json.dumps(record) + "\\n", encoding="utf-8"
+        json.dumps(record) + "\n", encoding="utf-8"
     )
     monkeypatch.setattr(
         "sys.argv",
