@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_sparse_kv_offload_cpu_pool_size_bytes,
     plan_sparse_kv_offload_memory,
 )
+from vllm_ascend.ascend_config import SparseKVOffloadConfig
 from vllm_ascend.utils import AscendDeviceType
 
 
@@ -403,3 +404,53 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _ShapeOnlyTensor:
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            start, stop, step = item.indices(self.shape[0])
+            return _ShapeOnlyTensor((len(range(start, stop, step)),))
+        raise TypeError(f"unsupported fake tensor index: {item!r}")
+
+    def view(self, shape_or_dtype):
+        if isinstance(shape_or_dtype, (tuple, list)):
+            return _ShapeOnlyTensor(shape_or_dtype)
+        return self
+
+
+def test_topk_buffer_allocator_uses_layer_override(monkeypatch):
+    target_layer = "model.layers.0.self_attn.attn"
+    config = SparseKVOffloadConfig(
+        enabled=True,
+        topk_buffer_size=4096,
+        layer_topk_buffer_sizes={target_layer: 6144},
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=2),
+    )
+    monkeypatch.setattr(
+        manager_module.torch,
+        "empty",
+        lambda shape, **kwargs: _ShapeOnlyTensor(shape),
+    )
+
+    target_k, target_v = manager_module.allocate_kv_offload_topk_buffer_pair(
+        vllm_config, config, layer_name=target_layer
+    )
+    other_k, other_v = manager_module.allocate_kv_offload_topk_buffer_pair(
+        vllm_config, config, layer_name="model.layers.1.self_attn.attn"
+    )
+
+    assert target_k.shape == (2, 6144, 1, 512)
+    assert target_v.shape == (2, 6144, 1, 64)
+    assert other_k.shape == (2, 4096, 1, 512)
+    assert other_v.shape == (2, 4096, 1, 64)
+
