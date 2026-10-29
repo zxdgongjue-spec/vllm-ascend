@@ -2098,6 +2098,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 layer_name=layer_name,
                 topk_indices=topk_indices,
                 metadata=attn_metadata,
+                indexer_metadata=indexer_attn_metadata,
                 kv_cache=kv_cache,
                 is_mtp_layer=self._is_mtp_layer,
                 forward_context=get_forward_context(),

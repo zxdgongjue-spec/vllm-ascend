@@ -139,6 +139,21 @@ def _distributed_rank_label() -> str | None:
     return None
 
 
+def _tensor_parallel_rank_label() -> str | None:
+    """Return the rank within the TP group when global rank is unavailable."""
+    try:
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        rank = getattr(group, "rank_in_group", None)
+        if rank is not None:
+            return f"tp{int(rank)}"
+    except Exception:
+        # Rank discovery is diagnostic only and must never affect inference.
+        pass
+    return None
+
+
 def _rank_label() -> str:
     rank = _distributed_rank_label()
     if rank is not None and rank.strip():
@@ -152,6 +167,10 @@ def _rank_label() -> str:
     value = os.environ.get("LOCAL_RANK")
     if value is not None and value.strip():
         return value.strip().replace("/", "_")
+
+    rank = _tensor_parallel_rank_label()
+    if rank is not None:
+        return rank
     return "unknown"
 
 
@@ -220,6 +239,7 @@ def observe_sfa_topk(
     layer_name: str,
     topk_indices: Any,
     metadata: Any,
+    indexer_metadata: Any = None,
     kv_cache: Any = None,
     is_mtp_layer: bool = False,
     forward_context: Any = None,
@@ -248,14 +268,61 @@ def observe_sfa_topk(
         if not rows:
             return
 
+        query_rows_before_local_filter = len(rows)
+        local_query_cum_lens = None
+        local_key_lens = None
+        local_query_rows_expected = None
+        local_query_positions = None
+        if indexer_metadata is not None:
+            raw_local_query_cum_lens = _to_list(
+                getattr(indexer_metadata, "actual_seq_lengths_query", None)
+            )
+            if isinstance(raw_local_query_cum_lens, (list, tuple)):
+                local_query_cum_lens = [
+                    _safe_int(value, 0) for value in raw_local_query_cum_lens
+                ]
+                local_query_rows_expected = max(local_query_cum_lens, default=0)
+                # DSA-CP pads the input token count to TP size. Ranks with no
+                # real local query must not contribute all--1 padding rows to
+                # the resident-capacity trace.
+                if local_query_rows_expected <= 0:
+                    return
+                rows = rows[:local_query_rows_expected]
+                if not rows:
+                    return
+
+            raw_local_key_lens = _to_list(
+                getattr(indexer_metadata, "actual_seq_lengths_key", None)
+            )
+            if isinstance(raw_local_key_lens, (list, tuple)):
+                local_key_lens = [_safe_int(value, 0) for value in raw_local_key_lens]
+            raw_local_positions = _to_list(
+                getattr(indexer_metadata, "query_positions", None)
+            )
+            if isinstance(raw_local_positions, (list, tuple)):
+                local_query_positions = [_safe_int(value, -1) for value in raw_local_positions]
+
         seq_lens = _to_list(getattr(metadata, "seq_lens", None)) or []
-        positions = _to_list(getattr(metadata, "positions", None))
-        query_start_loc = _to_list(getattr(metadata, "query_start_loc", None))
-        if positions is not None:
-            positions = positions[:num_actual_tokens]
-        if query_start_loc is not None:
-            query_start_loc = [int(value) for value in query_start_loc]
-        seq_lens = [int(value) for value in seq_lens]
+        global_positions = _to_list(getattr(metadata, "positions", None))
+        global_query_start_loc = _to_list(getattr(metadata, "query_start_loc", None))
+        if global_positions is not None:
+            global_positions = [_safe_int(value, -1) for value in global_positions]
+        if global_query_start_loc is not None:
+            global_query_start_loc = [_safe_int(value, 0) for value in global_query_start_loc]
+        if local_query_positions is not None:
+            positions = local_query_positions[:len(rows)]
+        elif global_positions is not None:
+            positions = global_positions[:len(rows)]
+        else:
+            positions = None
+        # The analyzer maps each captured row back to a request. In DSA-CP,
+        # use local cumulative query boundaries so the mapping matches the
+        # rank-local rows rather than the unsharded global token layout.
+        if local_query_cum_lens is not None:
+            query_start_loc = [0, *local_query_cum_lens]
+        else:
+            query_start_loc = global_query_start_loc
+        seq_lens = [_safe_int(value, 0) for value in seq_lens]
 
         block_size = _safe_int(getattr(metadata, "block_size", 0))
         topk_item_count = sum(len(row) for row in rows)
@@ -279,6 +346,13 @@ def observe_sfa_topk(
             "num_decodes": num_decodes,
             "num_actual_tokens": num_actual_tokens,
             "num_query_rows": len(rows),
+            "local_query_rows_expected": local_query_rows_expected,
+            "query_rows_before_local_filter": query_rows_before_local_filter,
+            "query_rows_dropped_as_parallel_padding": max(
+                0, query_rows_before_local_filter - len(rows)
+            ),
+            "indexer_actual_seq_lengths_query": local_query_cum_lens,
+            "indexer_actual_seq_lengths_key": local_key_lens,
             "topk_width": max((len(row) for row in rows), default=0),
             "topk_item_count": topk_item_count,
             "valid_topk_items": valid_topk_items,
@@ -292,6 +366,7 @@ def observe_sfa_topk(
             "seq_lens": seq_lens,
             "positions": positions,
             "query_start_loc": query_start_loc,
+            "global_query_start_loc": global_query_start_loc,
             "block_size": block_size or None,
             "seq_len_tail_tokens": (
                 [value % block_size for value in seq_lens] if block_size > 0 else None

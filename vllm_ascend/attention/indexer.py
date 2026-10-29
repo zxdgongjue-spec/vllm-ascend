@@ -87,6 +87,9 @@ class AscendSFAIndexerMetadata:
     # The PCP cache-write gather splits the local prefill region on this
     # independently computed decode-token count.
     num_decode_tokens: int = 0
+    # Query positions aligned with the rank-local TopK rows. Under DSA-CP,
+    # this excludes TP-alignment padding rows and is used only by opt-in tracing.
+    query_positions: torch.Tensor | None = None
     # Optional selection supplied by the owning attention implementation.
     # Projection, rope and cache writes continue to use this backend.
     # The selector receives ``(q_li, weights, indexer, metadata, q_li_scale)``;
@@ -1107,6 +1110,15 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             )
         self._mask_lim_slot_mapping(common_attn_metadata, slot_mapping, buffer_key)
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+        query_positions = input_positions
+        if self.use_dsa_cp and not self.use_pcp:
+            # DSA-CP shards the token rows across TP and pads the final shard.
+            # Keep the real positions for this rank aligned with local TopK rows.
+            num_tokens_pad = _round_up(num_input_tokens, self.dsa_cp_world_size)
+            num_tokens_per_device = num_tokens_pad // self.dsa_cp_world_size
+            local_start = get_tp_group().rank_in_group * num_tokens_per_device
+            local_end = min(local_start + num_tokens_per_device, num_input_tokens)
+            query_positions = input_positions[local_start:local_end]
         block_size = self.kernel_block_size
 
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=use_cached_rope)
@@ -1177,4 +1189,5 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
             num_decode_tokens=num_decode_tokens,
+            query_positions=query_positions,
         )

@@ -130,3 +130,82 @@ def test_rank_label_falls_back_to_local_rank(monkeypatch):
     monkeypatch.delenv("RANK_ID", raising=False)
     monkeypatch.setenv("LOCAL_RANK", "3")
     assert observer._rank_label() == "3"
+
+
+
+def test_observer_skips_rank_with_no_local_query_rows(tmp_path, monkeypatch):
+    reset_observer(monkeypatch, tmp_path)
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=1,
+        num_actual_tokens=4,
+        seq_lens=FakeTensor([12004], (1,)),
+        positions=FakeTensor([12000, 12001, 12002, 12003], (4,)),
+        query_start_loc=FakeTensor([0, 4], (2,)),
+        block_size=128,
+    )
+    indexer_metadata = SimpleNamespace(
+        actual_seq_lengths_query=FakeTensor([0], (1,)),
+        actual_seq_lengths_key=FakeTensor([0], (1,)),
+        query_positions=FakeTensor([], (0,)),
+    )
+    topk = FakeTensor([[[-1, -1, -1]]], (1, 1, 3))
+
+    observer.observe_sfa_topk(
+        layer_name="model.layers.0.self_attn.attn",
+        topk_indices=topk,
+        metadata=metadata,
+        indexer_metadata=indexer_metadata,
+    )
+
+    assert list(tmp_path.glob("topk_trace_rank*_pid*.jsonl")) == []
+    assert list(tmp_path.glob("manifest_rank*_pid*.json")) == []
+
+
+def test_observer_trims_parallel_padding_and_uses_local_positions(tmp_path, monkeypatch):
+    reset_observer(monkeypatch, tmp_path)
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=1,
+        num_actual_tokens=3,
+        seq_lens=FakeTensor([103], (1,)),
+        positions=FakeTensor([100, 101, 102], (3,)),
+        query_start_loc=FakeTensor([0, 3], (2,)),
+        block_size=16,
+    )
+    indexer_metadata = SimpleNamespace(
+        actual_seq_lengths_query=FakeTensor([1], (1,)),
+        actual_seq_lengths_key=FakeTensor([101], (1,)),
+        query_positions=FakeTensor([101], (1,)),
+    )
+    topk = FakeTensor(
+        [[[1, 2, -1]], [[-1, -1, -1]]],
+        (2, 1, 3),
+    )
+
+    observer.observe_sfa_topk(
+        layer_name="model.layers.0.self_attn.attn",
+        topk_indices=topk,
+        metadata=metadata,
+        indexer_metadata=indexer_metadata,
+    )
+
+    trace_files = list(tmp_path.glob("topk_trace_rank*_pid*.jsonl"))
+    assert len(trace_files) == 1
+    record = json.loads(trace_files[0].read_text(encoding="utf-8").splitlines()[0])
+    assert record["topk_indices"] == [[1, 2, -1]]
+    assert record["positions"] == [101]
+    assert record["query_start_loc"] == [0, 1]
+    assert record["global_query_start_loc"] == [0, 3]
+    assert record["local_query_rows_expected"] == 1
+    assert record["query_rows_before_local_filter"] == 2
+    assert record["query_rows_dropped_as_parallel_padding"] == 1
+    assert record["indexer_actual_seq_lengths_key"] == [101]
+
+
+def test_rank_label_falls_back_to_tensor_parallel_rank(monkeypatch):
+    monkeypatch.setattr(observer, "_distributed_rank_label", lambda: None)
+    monkeypatch.setattr(observer, "_tensor_parallel_rank_label", lambda: "tp4")
+    for name in ("RANK", "RANK_ID", "LOCAL_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    assert observer._rank_label() == "tp4"
