@@ -849,8 +849,28 @@ class SparseKVOffloadManager:
                     f"Sparse KV offload layer {layer_name}: expected tuple length "
                     f"{OFFLOAD_KV_CACHE_TUPLE_LEN}, got {tuple_len}"
                 )
-            self.topk_buffers_k.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_K_INDEX])
-            self.topk_buffers_v.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_V_INDEX])
+            buffer_k = cache_or_caches[OFFLOAD_TOPK_BUFFER_K_INDEX]
+            buffer_v = cache_or_caches[OFFLOAD_TOPK_BUFFER_V_INDEX]
+            if not self.use_fused_copy_sfa:
+                expected_capacity = self.layer_topk_buffer_sizes[layer_name]
+                actual_capacity = int(buffer_k.shape[1])
+                if actual_capacity != expected_capacity or int(buffer_v.shape[1]) != expected_capacity:
+                    raise RuntimeError(
+                        "DSA per-layer resident allocation does not match config: "
+                        f"layer={layer_name}, expected={expected_capacity}, "
+                        f"k_shape={tuple(buffer_k.shape)}, v_shape={tuple(buffer_v.shape)}"
+                    )
+                if layer_name in configured_overrides:
+                    logger.info(
+                        "DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=%s tokens=%s "
+                        "k_shape=%s v_shape=%s",
+                        layer_name,
+                        actual_capacity,
+                        tuple(buffer_k.shape),
+                        tuple(buffer_v.shape),
+                    )
+            self.topk_buffers_k.append(buffer_k)
+            self.topk_buffers_v.append(buffer_v)
             if self.tp_rank == 0:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
