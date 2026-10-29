@@ -7,6 +7,7 @@
 - `run_dsa_capacity_full_tp8.sh`：完整 GLM-5.3、TP=8 服务启动入口；负责环境检查、trace 目录创建和启动参数。
 - `run_dsa_capacity_trace.sh`：设置只读观测环境变量并启动指定命令。
 - `request_dsa_capacity_trace.py`：请求指定输入/输出 token 数，记录客户端请求与响应。
+- `audit_dsa_capacity_trace.py`：只读审计已有 Trace，按 Rank/Layer 汇总有效/负 TopK、DSA-CP query/key 元数据与 padding 行；不会修改原始 Trace。
 - 离线分析器仍使用仓库中的 `benchmarks/dsa/analyze_dsa_resident_capacity.py`，避免复制出第二份分析逻辑。
 
 ## 启动服务
@@ -29,6 +30,18 @@
     /usr/local/python3.12.13/bin/python benchmarks/dsa/capacity_trace/request_dsa_capacity_trace.py --base-url http://127.0.0.1:8080 --model glm --input-tokens 12000 --output-tokens 64 --seed 1024 --timeout 600 --trace-dir "$TRACE_DIR"
 
 请求脚本先调用 `/tokenize` 生成精确 token ID，再请求 `/v1/completions`；请求和响应元数据写入 TRACE_DIR。
+
+## 审计 Rank/Layer 数据差异（建议在容量分析前执行）
+
+```bash
+TRACE_DIR=$(cat /tmp/dsa_capacity_full_tp8_trace_dir)
+PY=/usr/local/python3.12.13/bin/python
+
+"$PY" benchmarks/dsa/capacity_trace/audit_dsa_capacity_trace.py \
+  --trace-dir "$TRACE_DIR"
+```
+
+审计结果写入 `$TRACE_DIR/analysis-trace-audit/`，包括 `summary.json`、`rank_summary.csv`、`rank_layer_summary.csv`。该脚本只读已有 Trace，不要求重启服务或重新发送请求。它会显示每个 Rank 的有效 TopK 分布，并输出可比较的 Layer 样本；负索引的语义仍需结合 DSA-CP/Indexer 实现确认，不会自动将其认定为合法 padding。
 
 ## 离线分析
 
