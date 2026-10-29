@@ -5611,6 +5611,7 @@ class NPUModelRunner(GPUModelRunner):
                             self.tp_rank,
                             self.vllm_config,
                             self.sparse_kv_offload_config,
+                            layer_name=layer_name,
                         )
                         kv_caches[layer_name] = reshaped_tensors
                         continue
