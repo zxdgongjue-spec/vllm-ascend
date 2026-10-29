@@ -145,3 +145,54 @@ def test_remote_dspark_requires_v2_context_initialization(fused_op_type):
         SparseKVOffloadConfig.from_additional_config(
             config, {"enabled": True, "fused_op_type": fused_op_type, "topk_buffer_size": 18432}
         )
+
+
+def make_layer_capacity_config(capacity, *, fused_op_type="none", baseline=4096):
+    vllm_config = make_config(v2=False, mtp=0)
+    vllm_config.cache_config = SimpleNamespace(block_size=128)
+    return SparseKVOffloadConfig.from_additional_config(
+        vllm_config,
+        {
+            "enabled": True,
+            "keep_device_kv_cache": True,
+            "topk_buffer_size": baseline,
+            "layer_topk_buffer_sizes": {"model.layers.0.self_attn.attn": capacity},
+            "fused_op_type": fused_op_type,
+        },
+    )
+
+
+def test_layer_resident_capacity_override_is_static_and_expansion_only():
+    config = make_layer_capacity_config(6144)
+    assert config.capacity_for_layer("model.layers.0.self_attn.attn") == 6144
+    assert config.capacity_for_layer("model.layers.1.self_attn.attn") == 4096
+    assert config.capacity_for_layer() == 4096
+
+
+def test_layer_resident_capacity_rejects_shrinking():
+    with pytest.raises(ValueError, match="expansion-only"):
+        make_layer_capacity_config(3072)
+
+
+def test_layer_resident_capacity_rejects_unaligned_size():
+    with pytest.raises(ValueError, match="divisible by cache block_size"):
+        make_layer_capacity_config(6145)
+
+
+def test_layer_resident_capacity_rejects_fused_paths_in_minimal_p0():
+    with pytest.raises(ValueError, match="non-fused"):
+        make_layer_capacity_config(6144, fused_op_type="fused_copy_sfa")
+    with pytest.raises(ValueError, match="non-fused"):
+        config = make_config(v2=False, mtp=0)
+        config.cache_config = SimpleNamespace(block_size=128)
+        SparseKVOffloadConfig.from_additional_config(
+            config,
+            {
+                "enabled": True,
+                "keep_device_kv_cache": True,
+                "topk_buffer_size": 4096,
+                "layer_topk_buffer_sizes": {"model.layers.0.self_attn.attn": 6144},
+                "use_fused_overlap": True,
+            },
+        )
+
