@@ -346,6 +346,7 @@ def main() -> int:
     curve_rows: list[dict[str, Any]] = []
     capacity_curves: dict[tuple[str, str, str, int], dict[str, Any]] = {}
     analysis_usable_by_group: dict[tuple[str, str, str], bool] = {}
+    allocation_eligible_by_group: dict[tuple[str, str, str], bool] = {}
 
     for key, group_records in sorted(groups.items()):
         group_records.sort(key=lambda item: int(item.get("trace_seq") or 0))
@@ -359,6 +360,12 @@ def main() -> int:
         layer_rows.append(group_summary)
         analysis_usable = bool(group_summary["analysis_usable"])
         analysis_usable_by_group[key] = analysis_usable
+        # Allocation is a decision output, so require fully clean indices.
+        # Mixed negative indices remain visible in curves but are not eligible
+        # until their padding/CP-sentinel semantics are confirmed.
+        allocation_eligible_by_group[key] = (
+            analysis_usable and group_summary["analysis_status"] == "VALID"
+        )
         raw_rows = [row["indices"] for row in query_rows]
         for capacity in args.capacities:
             if analysis_usable:
@@ -402,14 +409,14 @@ def main() -> int:
             allocation_groups = {
                 key: value
                 for key, value in query_rows_by_group.items()
-                if analysis_usable_by_group.get(key, False)
+                if allocation_eligible_by_group.get(key, False)
                 and not any(bool(record.get("is_mtp_layer")) for record in groups[key])
             }
         else:
             allocation_groups = {
                 key: value
                 for key, value in query_rows_by_group.items()
-                if analysis_usable_by_group.get(key, False)
+                if allocation_eligible_by_group.get(key, False)
             }
         allocation_keys = set(allocation_groups)
         allocation_curves = {
@@ -433,6 +440,10 @@ def main() -> int:
     groups_with_negative_padding_count = sum(
         1 for row in layer_rows if int(row["negative_padding_items"]) > 0
     )
+    allocation_eligible_group_count = sum(
+        1 for eligible in allocation_eligible_by_group.values() if eligible
+    )
+    allocation_excluded_group_count = len(groups) - allocation_eligible_group_count
     if valid_topk_item_count == 0:
         data_quality_status = "FAIL"
     elif unusable_group_count or negative_padding_item_count:
@@ -457,6 +468,11 @@ def main() -> int:
             "Their semantics are not inferred; confirm whether they are padding or rank/CP sentinels "
             "before making a final capacity decision."
         )
+    if args.total_budget is not None and allocation_excluded_group_count:
+        warnings.append(
+            f"{allocation_excluded_group_count} groups are excluded from capacity allocation because "
+            "their TopK trace is unusable or contains unresolved negative indices."
+        )
     if valid_topk_item_count == 0:
         warnings.append("No valid TopK indices were observed; do not draw capacity conclusions from this trace.")
 
@@ -477,6 +493,8 @@ def main() -> int:
         "unusable_capacity_group_count": unusable_group_count,
         "groups_without_valid_topk_count": no_valid_topk_group_count,
         "groups_with_rows_without_valid_topk_count": partial_no_valid_rows_group_count,
+        "allocation_eligible_group_count": allocation_eligible_group_count,
+        "allocation_excluded_group_count": allocation_excluded_group_count,
         "trace_dir": str(trace_dir),
         "trace_files": [Path(path).name for path in trace_files],
         "trace_file_count": len(trace_files),

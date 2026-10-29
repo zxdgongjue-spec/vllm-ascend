@@ -140,6 +140,8 @@ def test_main_marks_negative_index_semantics_as_partial_quality(tmp_path, monkey
             str(trace_dir),
             "--capacities",
             "0,1",
+            "--total-budget",
+            "1",
         ],
     )
 
@@ -147,4 +149,9 @@ def test_main_marks_negative_index_semantics_as_partial_quality(tmp_path, monkey
     summary = json.loads((trace_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["data_quality_status"] == "PARTIAL"
     assert summary["negative_index_item_count"] == 1
+    assert summary["allocation_eligible_group_count"] == 0
+    assert summary["allocation_excluded_group_count"] == 1
     assert any("Their semantics are not inferred" in warning for warning in summary["warnings"])
+    allocation_path = trace_dir / "capacity_allocation.csv"
+    assert allocation_path.exists()
+    assert allocation_path.read_text(encoding="utf-8") == ""
