@@ -162,3 +162,17 @@ def test_zero_local_decode_rank_still_joins_tp_barrier():
         )
 
     manager.tp_group.broadcast.assert_called_once()
+
+
+def test_dsa_cp_prefill_rejects_missing_device_main_cache_before_native_write():
+    impl = AscendSFAKVOffloadDSACPImpl.__new__(AscendSFAKVOffloadDSACPImpl)
+    metadata = SimpleNamespace(attn_state=object(), num_prefills=1, num_decodes=0)
+    with pytest.raises(RuntimeError, match="keep_device_kv_cache=True"):
+        impl.exec_kv(
+            kv_no_split=torch.empty((1, 1)),
+            cos=torch.empty((1, 1)),
+            sin=torch.empty((1, 1)),
+            kv_cache=(None, None),
+            slots=torch.empty((1,), dtype=torch.int64),
+            attn_metadata=metadata,
+        )

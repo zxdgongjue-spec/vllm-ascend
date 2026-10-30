@@ -117,6 +117,11 @@ class AscendSFAKVOffloadDSACPImpl(AscendSFAKVOffloadImpl, AscendSFADSACPImpl):
 
         # Prefill/mixed batches retain the native DSA-CP local cache write.
         # The full gathered cache is committed to Host KV in _store_parallel_kv.
+        if kv_cache is None or kv_cache[0] is None or kv_cache[1] is None:
+            raise RuntimeError(
+                "DSA-CP Sparse KV prefill requires keep_device_kv_cache=True so the gathered "
+                "global KV can be staged to the Host KV pool."
+            )
         return super(AscendSFAKVOffloadImpl, self).exec_kv(
             kv_no_split, cos, sin, kv_cache, slots, attn_metadata
         )
