@@ -454,3 +454,49 @@ def test_topk_buffer_allocator_uses_layer_override(monkeypatch):
     assert other_k.shape == (2, 4096, 1, 512)
     assert other_v.shape == (2, 4096, 1, 64)
 
+def test_profile_buffer_allocator_uses_layer_overrides_and_logs_count(monkeypatch):
+    target_layers = {
+        "model.layers.0.self_attn.attn": 6144,
+        "model.layers.1.self_attn.attn": 8192,
+    }
+    config = SparseKVOffloadConfig(
+        enabled=True,
+        topk_buffer_size=4096,
+        layer_topk_buffer_sizes=target_layers,
+    )
+    kv_cache_spec = {
+        **{name: SimpleNamespace(store_on_host=True) for name in target_layers},
+        "device.layer": SimpleNamespace(store_on_host=False),
+    }
+    calls = []
+
+    class _FakeProfileBuffer:
+        def numel(self):
+            return 1
+
+        def element_size(self):
+            return 2
+
+    def allocate(_vllm_config, sparse_config, layer_name=None):
+        calls.append((layer_name, sparse_config.capacity_for_layer(layer_name)))
+        return _FakeProfileBuffer(), _FakeProfileBuffer()
+
+    monkeypatch.setattr(
+        manager_module,
+        "allocate_kv_offload_topk_buffer_pair",
+        allocate,
+    )
+    with patch.object(manager_module.logger, "info_once") as log_info:
+        buffers = manager_module.allocate_kv_offload_topk_profile_buffers(
+            kv_cache_spec,
+            SimpleNamespace(),
+            config,
+        )
+
+    assert len(buffers) == 2
+    assert calls == [
+        ("model.layers.0.self_attn.attn", 6144),
+        ("model.layers.1.self_attn.attn", 8192),
+    ]
+    assert log_info.call_count == 1
+    assert log_info.call_args.args[-1] == 2
