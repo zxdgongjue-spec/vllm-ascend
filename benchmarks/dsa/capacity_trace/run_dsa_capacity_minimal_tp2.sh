@@ -136,7 +136,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
-export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-0}"
 export ASCEND_PROCESS_LOG_PATH="$TRACE_DIR/plog"
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_dsa_capacity_${STAMP}_$$"
@@ -156,6 +156,7 @@ echo "VISIBLE_DEVICES=$VISIBLE_DEVICES"
 echo "TRACE_DIR=$TRACE_DIR"
 echo "SERVER_LOG=$SERVER_LOG"
 echo "CAPACITY_MODE=single-layer static expansion; keep_device_kv_cache=true"
+echo "ASCEND_LAUNCH_BLOCKING=$ASCEND_LAUNCH_BLOCKING"
 echo "NOTE: this run validates configuration/allocation/correctness only; do not use its latency as a performance result."
 
 nohup vllm serve "$MODEL" \
