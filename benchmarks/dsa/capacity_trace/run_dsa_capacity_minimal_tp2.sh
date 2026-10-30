@@ -9,11 +9,14 @@ REPO="${REPO:-/home/z00945955/IO/vllm-ascend}"
 MODEL="${MODEL:-/home/z00945955/glm5-mtp-4l}"
 PORT="${PORT:-8081}"
 DP_RPC_PORT="${DP_RPC_PORT:-13389}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm}"
 LOCAL_IP="${LOCAL_IP:-}"
 VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-6,7}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Sparse KV offload currently rejects packed SFA main caches (C8/TQ4).
+# Use "auto" for the main cache (model dtype); keep LI indexer cache at FP8 below.
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 TARGET_LAYER="${TARGET_LAYER:-model.layers.0.self_attn.attn}"
 BASE_CAPACITY="${BASE_CAPACITY:-4096}"
 TARGET_CAPACITY="${TARGET_CAPACITY:-6144}"
@@ -32,6 +35,11 @@ grep -q 'layer_topk_buffer_sizes' vllm_ascend/ascend_config.py || {
   echo "ERROR: current checkout does not contain per-layer capacity support."
   exit 2
 }
+if [ "$KV_CACHE_DTYPE" != "auto" ]; then
+  echo "ERROR: this Sparse KV offload compatibility run requires KV_CACHE_DTYPE=auto."
+  echo "       FP8/INT8 main KV selects packed SFA C8, which the current offload path rejects."
+  exit 2
+fi
 
 if [ -z "$LOCAL_IP" ]; then
   LOCAL_IP=$("$PY" - <<'PY'
@@ -144,6 +152,9 @@ mkdir -p "$TRACE_DIR/plog" "$TRACE_DIR/server-trace"
 printf '%s\n' "$TRACE_DIR" > /tmp/dsa_capacity_minimal_tp2_trace_dir
 printf '%s\n' "$PORT" > "$TRACE_DIR/port.txt"
 printf '%s\n' "$DP_RPC_PORT" > "$TRACE_DIR/dp_rpc_port.txt"
+printf '%s\n' "$SERVED_MODEL_NAME" > "$TRACE_DIR/served_model_name.txt"
+printf '%s\n' "$MODEL" > "$TRACE_DIR/model_path.txt"
+printf '%s\n' "$KV_CACHE_DTYPE" > "$TRACE_DIR/kv_cache_dtype.txt"
 printf '%s\n' "$TARGET_LAYER" > "$TRACE_DIR/target_layer.txt"
 printf '%s\n' "$BASE_CAPACITY" > "$TRACE_DIR/base_capacity.txt"
 printf '%s\n' "$TARGET_CAPACITY" > "$TRACE_DIR/target_capacity.txt"
@@ -192,6 +203,7 @@ export TASK_QUEUE_ENABLE=1
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=100
 export ASCEND_LAUNCH_BLOCKING="${ASCEND_LAUNCH_BLOCKING:-0}"
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3000}"
 export ASCEND_PROCESS_LOG_PATH="$TRACE_DIR/plog"
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PROMETHEUS_MULTIPROC_DIR="/dev/shm/vllm_metrics_dsa_capacity_${STAMP}_$$"
@@ -207,11 +219,14 @@ echo "REPO=$REPO"
 echo "MODEL=$MODEL"
 echo "PORT=$PORT"
 echo "DP_RPC_PORT=$DP_RPC_PORT"
+echo "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
 echo "LOCAL_IP=$LOCAL_IP"
 echo "VISIBLE_DEVICES=$VISIBLE_DEVICES"
 echo "MAX_NUM_SEQS=$MAX_NUM_SEQS"
 echo "MAX_MODEL_LEN=$MAX_MODEL_LEN"
-echo "KV_CACHE_DTYPE=$KV_CACHE_DTYPE"
+echo "MAIN_KV_CACHE_DTYPE=$KV_CACHE_DTYPE (auto=model dtype; avoids packed SFA C8/TQ4)"
+echo "INDEXER_KV_CACHE_DTYPE=fp8 (LI C8 remains device-resident)"
+echo "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=$VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
 echo "BASELINE_RUNTIME=tp2.sh-compatible; DSA_CP=true; async_scheduling=true"
 echo "TRACE_DIR=$TRACE_DIR"
 echo "SERVER_LOG=$SERVER_LOG"
@@ -219,7 +234,7 @@ echo "CAPACITY_MODE=single-layer static expansion; keep_device_kv_cache=true"
 echo "ASCEND_LAUNCH_BLOCKING=$ASCEND_LAUNCH_BLOCKING"
 echo "NOTE: this run validates configuration/allocation/correctness only; do not use its latency as a performance result."
 
-nohup vllm serve "$MODEL" \
+if vllm serve "$MODEL" \
   --host 0.0.0.0 \
   --port "$PORT" \
   --distributed-executor-backend mp \
@@ -229,7 +244,7 @@ nohup vllm serve "$MODEL" \
   --data-parallel-rpc-port "$DP_RPC_PORT" \
   --tensor-parallel-size 2 \
   --seed 1024 \
-  --served-model-name glm-capacity \
+  --served-model-name "$SERVED_MODEL_NAME" \
   --enable-expert-parallel \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --max-model-len "$MAX_MODEL_LEN" \
@@ -247,14 +262,12 @@ nohup vllm serve "$MODEL" \
   --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --attention_config.indexer_kv_dtype fp8 \
   --additional_config "$ADDITIONAL_CONFIG" \
-  > "$SERVER_LOG" 2>&1 < /dev/null &
+  2>&1 | tee "$SERVER_LOG"; then
+  SERVER_RC=0
+else
+  SERVER_RC=$?
+fi
 
-SERVER_PID=$!
-printf '%s\n' "$SERVER_PID" > "$TRACE_DIR/server.pid"
-printf '%s\n' "$SERVER_PID" > /tmp/dsa_capacity_minimal_tp2_server_pid
-
-echo "SERVER_PID=$SERVER_PID"
-echo "SERVER_LOG=$SERVER_LOG"
-echo "TRACE_DIR=$TRACE_DIR"
-echo "Launch command returned; service is running in the background."
-echo "Next: bash benchmarks/dsa/capacity_trace/validate_dsa_capacity_minimal_tp2.sh"
+echo "VLLM_SERVE_EXIT_CODE=$SERVER_RC"
+echo "FOREGROUND_SERVER_STOPPED=1"
+exit "$SERVER_RC"

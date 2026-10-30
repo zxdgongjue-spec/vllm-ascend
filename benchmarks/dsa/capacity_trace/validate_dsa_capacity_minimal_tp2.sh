@@ -19,64 +19,39 @@ TARGET_CAPACITY="$(cat "$TRACE_DIR/target_capacity.txt")"
 SERVER_LOG="$TRACE_DIR/server.log"
 PLOG_DIR="$TRACE_DIR/plog"
 SERVER_TRACE_DIR="$TRACE_DIR/server-trace"
-SERVER_PID="$(cat "$TRACE_DIR/server.pid")"
+SERVED_MODEL_NAME="$(cat "$TRACE_DIR/served_model_name.txt")"
+MODEL="$(cat "$TRACE_DIR/model_path.txt")"
+KV_CACHE_DTYPE="$(cat "$TRACE_DIR/kv_cache_dtype.txt")"
 
 cd "$REPO"
 
-cleanup_server_tree() {
-  echo "CLEANUP_SERVER_TREE: pid=$SERVER_PID"
-  "$PY" - "$SERVER_PID" <<'PY' || true
+# The service runs in the foreground in terminal A. This validator runs in
+# terminal B and never kills a process; stop terminal A with Ctrl+C if needed.
+server_process_alive() {
+  "$PY" - "$MODEL" <<'PY'
 import os
-import signal
 import sys
-import time
 from pathlib import Path
 
-root = int(sys.argv[1])
-children = {}
+model = sys.argv[1]
 for proc in Path("/proc").iterdir():
-    if not proc.name.isdigit():
+    if not proc.name.isdigit() or int(proc.name) == os.getpid():
         continue
-    pid = int(proc.name)
     try:
-        stat = (proc / "stat").read_text()
-        fields = stat[stat.rfind(")") + 2:].split()
-        ppid = int(fields[1])
-        children.setdefault(ppid, []).append(pid)
-    except (OSError, ValueError, IndexError):
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\\x00", b" ").decode(errors="replace")
+    except (OSError, PermissionError, ProcessLookupError):
         continue
-
-order = []
-seen = set()
-stack = [root]
-while stack:
-    pid = stack.pop()
-    if pid in seen:
-        continue
-    seen.add(pid)
-    order.append(pid)
-    stack.extend(children.get(pid, []))
-
-for pid in reversed(order):
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        print("CLEANUP_PERMISSION_DENIED pid=", pid)
-time.sleep(2)
-for pid in reversed(order):
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        print("CLEANUP_PERMISSION_DENIED pid=", pid)
-print("CLEANUP_SIGNALLED_PIDS =", order)
+    if model in cmdline and "vllm" in cmdline and "serve" in cmdline:
+        raise SystemExit(0)
+raise SystemExit(1)
 PY
 }
 
-FATAL_PATTERN='EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\[4\]'
+stop_hint() {
+  echo "STOP_FOREGROUND_SERVER=Press Ctrl+C in terminal A (the vllm serve terminal)."
+}
+
+FATAL_PATTERN='Traceback (most recent call last)|NotImplementedError:|ERR99999 UNKNOWN|EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\[4\]'
 
 echo "===== 1. Wait for service ====="
 echo "TRACE_DIR=$TRACE_DIR"
@@ -93,7 +68,7 @@ for I in $(seq 1 120); do
     grep -ERni "$FATAL_PATTERN" "$SERVER_LOG" "$PLOG_DIR" 2>/dev/null | tail -n 120 || true
     echo "===== SERVER LOG TAIL ====="
     tail -n 240 "$SERVER_LOG" || true
-    cleanup_server_tree
+    stop_hint
     exit 7
   fi
   if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -102,10 +77,10 @@ for I in $(seq 1 120); do
     echo "WAIT_ITERATION=$I"
     break
   fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "ERROR: API server process exited before becoming healthy."
+  if ! server_process_alive; then
+    echo "ERROR: foreground vLLM server process exited before becoming healthy."
     tail -n 160 "$SERVER_LOG" || true
-    cleanup_server_tree
+    stop_hint
     exit 3
   fi
   sleep 5
@@ -116,7 +91,7 @@ if [ "$READY" -ne 1 ]; then
   echo "===== PLOG ERROR TAIL ====="
   grep -ERni 'ERROR|already been bound|listen the port|CreateChannels failed' "$PLOG_DIR" 2>/dev/null | tail -n 120 || true
   tail -n 160 "$SERVER_LOG" || true
-  cleanup_server_tree
+  stop_hint
   exit 4
 fi
 
@@ -126,7 +101,7 @@ if ! grep -F "DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=
   echo "ERROR: did not find the actual per-layer allocation confirmation in server.log."
   echo "Expected: DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=$TARGET_CAPACITY"
   tail -n 200 "$SERVER_LOG" || true
-  cleanup_server_tree
+  stop_hint
   exit 5
 fi
 grep -F "DSA_LAYER_RESIDENT_CAPACITY" "$SERVER_LOG" | tail -n 20
@@ -135,7 +110,7 @@ echo
 echo "===== 3. Send one fixed request: 12K input / 64 output ====="
 if "$PY" benchmarks/dsa/capacity_trace/request_dsa_capacity_trace.py \
     --base-url "http://127.0.0.1:$PORT" \
-    --model glm-capacity \
+    --model "$SERVED_MODEL_NAME" \
     --input-tokens 12000 \
     --output-tokens 64 \
     --seed 1024 \
@@ -146,7 +121,7 @@ else
   RC=$?
   echo "REQUEST_STATUS=FAIL rc=$RC"
   tail -n 200 "$SERVER_LOG" || true
-  cleanup_server_tree
+  stop_hint
   exit "$RC"
 fi
 
@@ -155,7 +130,7 @@ echo "===== 4. Verify service remains healthy ====="
 if ! curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
   echo "ERROR: service became unhealthy after the request."
   tail -n 200 "$SERVER_LOG" || true
-  cleanup_server_tree
+  stop_hint
   exit 6
 fi
 echo "POST_REQUEST_HEALTH=PASS"
@@ -178,3 +153,4 @@ echo
 echo "MINIMAL_LAYER_CAPACITY_SMOKE=PASS"
 echo "TRACE_DIR=$TRACE_DIR"
 echo "SERVER_LOG=$SERVER_LOG"
+echo "FOREGROUND_SERVER=Still running in terminal A; stop with Ctrl+C when finished."
