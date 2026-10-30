@@ -91,6 +91,7 @@ config = json.loads(config_path.read_text())
 sections = [config, config.get("text_config", {}), config.get("language_config", {}), config.get("model_config", {})]
 layers = next((x.get("num_hidden_layers") for x in sections if isinstance(x, dict) and x.get("num_hidden_layers") is not None), None)
 print("MODEL_NUM_HIDDEN_LAYERS =", layers)
+print("MODEL_TORCH_DTYPE =", config.get("torch_dtype", "not-declared"))
 if layers is not None and int(layers) > 4:
     raise SystemExit("STOP: this smoke script is intended for the 4-layer TP2 model.")
 

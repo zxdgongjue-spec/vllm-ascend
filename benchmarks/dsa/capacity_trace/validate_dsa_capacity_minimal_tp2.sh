@@ -38,7 +38,7 @@ for proc in Path("/proc").iterdir():
     if not proc.name.isdigit() or int(proc.name) == os.getpid():
         continue
     try:
-        cmdline = (proc / "cmdline").read_bytes().replace(b"\\x00", b" ").decode(errors="replace")
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
     except (OSError, PermissionError, ProcessLookupError):
         continue
     if model in cmdline and "vllm" in cmdline and "serve" in cmdline:
@@ -96,7 +96,18 @@ if [ "$READY" -ne 1 ]; then
 fi
 
 echo
-echo "===== 2. Verify configured capacity was actually allocated ====="
+echo "===== 2. Verify main-cache format is compatible with Sparse KV offload ====="
+if grep -Eiq 'Using (fp8|int8) data type to store kv cache' "$SERVER_LOG"; then
+  echo "ERROR: main KV cache resolved to FP8/INT8; this selects packed SFA C8 and is incompatible with Sparse KV offload."
+  grep -Ei 'Using .* data type to store kv cache' "$SERVER_LOG" | tail -n 10 || true
+  stop_hint
+  exit 8
+fi
+grep -Ei 'Using .* data type to store kv cache' "$SERVER_LOG" | tail -n 10 || true
+echo "MAIN_KV_CACHE_FORMAT_COMPATIBILITY=PASS"
+
+echo
+echo "===== 3. Verify configured capacity was actually allocated ====="
 if ! grep -F "DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=$TARGET_CAPACITY" "$SERVER_LOG" >/dev/null; then
   echo "ERROR: did not find the actual per-layer allocation confirmation in server.log."
   echo "Expected: DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=$TARGET_CAPACITY"
@@ -107,7 +118,7 @@ fi
 grep -F "DSA_LAYER_RESIDENT_CAPACITY" "$SERVER_LOG" | tail -n 20
 
 echo
-echo "===== 3. Send one fixed request: 12K input / 64 output ====="
+echo "===== 4. Send one fixed request: 12K input / 64 output ====="
 if "$PY" benchmarks/dsa/capacity_trace/request_dsa_capacity_trace.py \
     --base-url "http://127.0.0.1:$PORT" \
     --model "$SERVED_MODEL_NAME" \
@@ -126,7 +137,7 @@ else
 fi
 
 echo
-echo "===== 4. Verify service remains healthy ====="
+echo "===== 5. Verify service remains healthy ====="
 if ! curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
   echo "ERROR: service became unhealthy after the request."
   tail -n 200 "$SERVER_LOG" || true
@@ -136,7 +147,7 @@ fi
 echo "POST_REQUEST_HEALTH=PASS"
 
 echo
-echo "===== 5. Analyze trace if the offload path emitted records ====="
+echo "===== 6. Analyze trace if the offload path emitted records ====="
 if find "$SERVER_TRACE_DIR" -maxdepth 1 -type f -name 'topk_trace_rank*_pid*.jsonl' -print -quit | grep -q .; then
   "$PY" benchmarks/dsa/analyze_dsa_resident_capacity.py \
     --trace-dir "$SERVER_TRACE_DIR" \
