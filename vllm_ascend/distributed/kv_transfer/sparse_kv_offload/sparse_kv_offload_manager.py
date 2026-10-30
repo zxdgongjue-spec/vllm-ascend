@@ -188,7 +188,7 @@ def allocate_kv_offload_topk_profile_buffers(
     logger.info_once(
         "Sparse KV offload reserved %.2f GiB of KV offload topk buffers across %d layers for profile run.",
         buffer_bytes / (1 << 30),
-        num_offload_layers,
+        len(offload_layer_names),
     )
     return buffers
 
