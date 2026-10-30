@@ -1479,6 +1479,13 @@ class SparseKVOffloadManager:
                 "Sparse KV offload topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
+        if num_tokens == 0:
+            # DSA-CP ranks can own different numbers of local query rows.
+            # Zero-row ranks still join the TP rendezvous so non-empty ranks
+            # can safely finish TP0 planning/D2H before their local H2D.
+            if self.tp_size > 1:
+                self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
+            return
         if layer_id in [0, self.mtp_layer_id]:
             # metadata which are same across all layers, only compute/copy once in first layer.
             # last layer (mtp layer) may have different metadata, do not skip.

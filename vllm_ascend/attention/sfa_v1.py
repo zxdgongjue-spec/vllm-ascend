@@ -359,7 +359,12 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        if get_ascend_config().sparse_kv_offload_config.enabled:
+        ascend_config = get_ascend_config()
+        if ascend_config.sparse_kv_offload_config.enabled:
+            if ascend_config.enable_dsa_cp:
+                from vllm_ascend.attention.sfa_kv_offload_cp import AscendSFAKVOffloadDSACPMetadataBuilder
+
+                return AscendSFAKVOffloadDSACPMetadataBuilder
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadataBuilder
 
             return AscendSFAKVOffloadMetadataBuilder
@@ -379,7 +384,12 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
-        if get_ascend_config().sparse_kv_offload_config.enabled:
+        ascend_config = get_ascend_config()
+        if ascend_config.sparse_kv_offload_config.enabled:
+            if ascend_config.enable_dsa_cp:
+                from vllm_ascend.attention.sfa_kv_offload_cp import AscendSFAKVOffloadDSACPImpl
+
+                return AscendSFAKVOffloadDSACPImpl
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
             return AscendSFAKVOffloadImpl

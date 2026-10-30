@@ -805,6 +805,14 @@ class AscendConfig:
             )
         self.enable_dsa_cp = self.enable_dsa_cp and has_indexer and vc.parallel_config.use_sequence_parallel_moe
 
+        offload_config = self.sparse_kv_offload_config
+        if self.enable_dsa_cp and getattr(offload_config, "enabled", False):
+            if offload_config.use_fused_overlap or offload_config.use_fused_copy_sfa:
+                raise ValueError(
+                    "DSA-CP with Sparse KV offload currently supports only the non-fused "
+                    "resident/offload path; disable use_fused_overlap and fused_op_type."
+                )
+
         # Sequence-parallel max_num_batched_tokens divisibility writeback
         if vc.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vc):
             tp_pcp_size = vc.parallel_config.tensor_parallel_size * vc.parallel_config.prefill_context_parallel_size

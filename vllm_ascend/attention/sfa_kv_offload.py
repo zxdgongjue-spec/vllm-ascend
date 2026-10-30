@@ -498,6 +498,8 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
 class AscendSFAKVOffloadImpl(AscendSFAImpl):
     """SFA implementation that routes main MLA K/V through the CPU pool."""
 
+    supports_dsa_cp = False
+
     def __init__(
         self,
         num_heads: int,
@@ -528,8 +530,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             kv_sharing_target_layer_name,
             **kwargs,
         )
-        if enable_dsa_cp():
-            raise NotImplementedError("Sparse KV offload currently requires TP without context parallelism")
+        if enable_dsa_cp() and not self.supports_dsa_cp:
+            raise NotImplementedError("Sparse KV offload requires the DSA-CP-aware implementation when DSA-CP is enabled.")
         if self.uses_packed_sfa_main_cache:
             raise NotImplementedError(
                 "Sparse KV offload does not support packed SFA main caches "
@@ -1627,7 +1629,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             result = self._copy_sfa_attention(ql_nope, q_pe, topk_indices, attn_metadata, manager, layer_name)
             return self._pad_to_input_tokens(result, ql_nope.shape[0])
 
-        if num_decode_tokens == 0:
+        if num_decodes == 0:
             # Pure prefill batch (colocate debug only).
             _check_device_kv_cache_exist()
             return super()._execute_sparse_flash_attention_process(
@@ -1733,18 +1735,24 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             capturing=self._in_graph_runtime(),
             skip_topk=self.skip_topk,
         )
-        decode_attn_output = DeviceOperator.execute_sparse_flash_attention_process(
-            self,
-            ql_nope[:num_decode_tokens],
-            q_pe[:num_decode_tokens],
-            (resident_k, resident_v),
-            resident_slot_indices.unsqueeze(1),
-            attn_metadata,
-            resident_query_lens,
-            resident_seq_lens,
-            block_table=resident_block_table,
-        )
-        if num_prefills == 0:
+        if num_decode_tokens == 0:
+            # A DSA-CP rank can own no decode rows while other TP ranks do.
+            # It must still join the manager's TP synchronization above, but
+            # there is no local sparse-attention work to launch.
+            decode_attn_output = ql_nope[:0]
+        else:
+            decode_attn_output = DeviceOperator.execute_sparse_flash_attention_process(
+                self,
+                ql_nope[:num_decode_tokens],
+                q_pe[:num_decode_tokens],
+                (resident_k, resident_v),
+                resident_slot_indices.unsqueeze(1),
+                attn_metadata,
+                resident_query_lens,
+                resident_seq_lens,
+                block_table=resident_block_table,
+            )
+        if num_prefills == 0 or num_decode_tokens >= ql_nope.shape[0]:
             return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])
 
         # Mixed batch (colocate debug only): prefill rows still attend the NPU
