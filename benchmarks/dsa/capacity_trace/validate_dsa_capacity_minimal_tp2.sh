@@ -76,7 +76,7 @@ print("CLEANUP_SIGNALLED_PIDS =", order)
 PY
 }
 
-FATAL_PATTERN='EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\\[4\\]'
+FATAL_PATTERN='EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\[4\]'
 
 echo "===== 1. Wait for service ====="
 echo "TRACE_DIR=$TRACE_DIR"

@@ -103,12 +103,12 @@ for proc in Path("/proc").iterdir():
     if pid == os.getpid():
         continue
     try:
-        cmdline = (proc / "cmdline").read_bytes().replace(b"\\0", b" ").decode(errors="replace")
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
         if not (("vllm" in cmdline and "serve" in cmdline)
                 or "VLLM::EngineCore" in cmdline
                 or "Worker_TP" in cmdline):
             continue
-        env_items = (proc / "environ").read_bytes().split(b"\\0")
+        env_items = (proc / "environ").read_bytes().split(b"\x00")
         env = {}
         for item in env_items:
             if b"=" in item:
@@ -121,10 +121,10 @@ for proc in Path("/proc").iterdir():
         continue
 
 if conflicts:
-    details = "\\n".join(f"  pid={pid}: {cmd}" for pid, cmd in conflicts)
+    details = "\n".join(f"  pid={pid}: {cmd}" for pid, cmd in conflicts)
     raise SystemExit(
         "STOP: another vLLM process already targets ASCEND_RT_VISIBLE_DEVICES="
-        f"{visible_devices}. Stop that service before starting this TP2 test:\\n{details}"
+        f"{visible_devices}. Stop that service before starting this TP2 test:\n{details}"
     )
 
 print("NO_EXISTING_VLLM_PROCESS_ON_VISIBLE_DEVICES =", visible_devices)
