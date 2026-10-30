@@ -8,8 +8,12 @@ set -euo pipefail
 REPO="${REPO:-/home/z00945955/IO/vllm-ascend}"
 MODEL="${MODEL:-/home/z00945955/glm5-mtp-4l}"
 PORT="${PORT:-8081}"
+DP_RPC_PORT="${DP_RPC_PORT:-13389}"
 LOCAL_IP="${LOCAL_IP:-}"
 VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-6,7}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 TARGET_LAYER="${TARGET_LAYER:-model.layers.0.self_attn.attn}"
 BASE_CAPACITY="${BASE_CAPACITY:-4096}"
 TARGET_CAPACITY="${TARGET_CAPACITY:-6144}"
@@ -55,16 +59,20 @@ if ! [[ "$LOCAL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 2
 fi
 
-"$PY" - "$REPO" "$MODEL/config.json" "$PORT" "$BASE_CAPACITY" "$TARGET_CAPACITY" <<'PY'
+"$PY" - "$REPO" "$MODEL/config.json" "$PORT" "$DP_RPC_PORT" "$LOCAL_IP" "$VISIBLE_DEVICES" "$BASE_CAPACITY" "$TARGET_CAPACITY" <<'PY'
 import importlib
 import json
+import os
 import socket
 import sys
 from pathlib import Path
 
 repo = Path(sys.argv[1]).resolve()
 config_path = Path(sys.argv[2])
-port, baseline, target = map(int, sys.argv[3:])
+port, dp_rpc_port = map(int, sys.argv[3:5])
+local_ip, visible_devices = sys.argv[5:7]
+baseline, target = map(int, sys.argv[7:9])
+
 module = importlib.import_module("vllm_ascend")
 loaded = Path(module.__file__).resolve()
 print("ASCEND_SOURCE =", loaded)
@@ -83,14 +91,59 @@ if baseline <= 0 or target <= baseline:
 if baseline % 128 or target % 128:
     raise SystemExit("STOP: both capacities must be multiples of block_size=128.")
 
-with socket.socket() as sock:
-    if sock.connect_ex(("127.0.0.1", port)) == 0:
-        raise SystemExit(f"STOP: port {port} is occupied; choose another PORT or stop that service.")
+def normalize_devices(value):
+    return tuple(sorted(part.strip() for part in value.split(",") if part.strip()))
+
+target_devices = normalize_devices(visible_devices)
+conflicts = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    if pid == os.getpid():
+        continue
+    try:
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\\0", b" ").decode(errors="replace")
+        if not (("vllm" in cmdline and "serve" in cmdline)
+                or "VLLM::EngineCore" in cmdline
+                or "Worker_TP" in cmdline):
+            continue
+        env_items = (proc / "environ").read_bytes().split(b"\\0")
+        env = {}
+        for item in env_items:
+            if b"=" in item:
+                key, value = item.split(b"=", 1)
+                env[key.decode(errors="ignore")] = value.decode(errors="ignore")
+        process_devices = normalize_devices(env.get("ASCEND_RT_VISIBLE_DEVICES", ""))
+        if process_devices and process_devices == target_devices:
+            conflicts.append((pid, cmdline[:180]))
+    except (OSError, PermissionError, ProcessLookupError):
+        continue
+
+if conflicts:
+    details = "\\n".join(f"  pid={pid}: {cmd}" for pid, cmd in conflicts)
+    raise SystemExit(
+        "STOP: another vLLM process already targets ASCEND_RT_VISIBLE_DEVICES="
+        f"{visible_devices}. Stop that service before starting this TP2 test:\\n{details}"
+    )
+
+print("NO_EXISTING_VLLM_PROCESS_ON_VISIBLE_DEVICES =", visible_devices)
+
+for host in dict.fromkeys(("127.0.0.1", local_ip)):
+    for check_port, label in ((port, "API"), (dp_rpc_port, "DP RPC")):
+        with socket.socket() as sock:
+            if sock.connect_ex((host, check_port)) == 0:
+                raise SystemExit(
+                    f"STOP: {label} port {check_port} is already listening on {host}; "
+                    "stop the existing service or choose unused ports."
+                )
+print("PORT_PREFLIGHT_PASS: API =", port, "DP_RPC =", dp_rpc_port)
 PY
 
 mkdir -p "$TRACE_DIR/plog" "$TRACE_DIR/server-trace"
 printf '%s\n' "$TRACE_DIR" > /tmp/dsa_capacity_minimal_tp2_trace_dir
 printf '%s\n' "$PORT" > "$TRACE_DIR/port.txt"
+printf '%s\n' "$DP_RPC_PORT" > "$TRACE_DIR/dp_rpc_port.txt"
 printf '%s\n' "$TARGET_LAYER" > "$TRACE_DIR/target_layer.txt"
 printf '%s\n' "$BASE_CAPACITY" > "$TRACE_DIR/base_capacity.txt"
 printf '%s\n' "$TARGET_CAPACITY" > "$TRACE_DIR/target_capacity.txt"
@@ -103,7 +156,9 @@ from pathlib import Path
 out, layer, baseline, target = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 config = {
     "ascend_compilation_config": {"enable_super_kernel": False},
-    "enable_dsa_cp": False,
+    "enable_cpu_binding": "True",
+    "multistream_overlap_shared_expert": True,
+    "enable_dsa_cp": True,
     "sparse_kv_offload_config": {
         "enabled": True,
         "topk_buffer_size": baseline,
@@ -151,8 +206,13 @@ echo "===== 2. Launch debug offload service ====="
 echo "REPO=$REPO"
 echo "MODEL=$MODEL"
 echo "PORT=$PORT"
+echo "DP_RPC_PORT=$DP_RPC_PORT"
 echo "LOCAL_IP=$LOCAL_IP"
 echo "VISIBLE_DEVICES=$VISIBLE_DEVICES"
+echo "MAX_NUM_SEQS=$MAX_NUM_SEQS"
+echo "MAX_MODEL_LEN=$MAX_MODEL_LEN"
+echo "KV_CACHE_DTYPE=$KV_CACHE_DTYPE"
+echo "BASELINE_RUNTIME=tp2.sh-compatible; DSA_CP=true; async_scheduling=true"
 echo "TRACE_DIR=$TRACE_DIR"
 echo "SERVER_LOG=$SERVER_LOG"
 echo "CAPACITY_MODE=single-layer static expansion; keep_device_kv_cache=true"
@@ -166,21 +226,25 @@ nohup vllm serve "$MODEL" \
   --data-parallel-size 1 \
   --data-parallel-size-local 1 \
   --data-parallel-address "$LOCAL_IP" \
-  --data-parallel-rpc-port 13390 \
+  --data-parallel-rpc-port "$DP_RPC_PORT" \
   --tensor-parallel-size 2 \
   --seed 1024 \
   --served-model-name glm-capacity \
   --enable-expert-parallel \
-  --max-num-seqs 1 \
-  --max-model-len 16384 \
+  --max-num-seqs "$MAX_NUM_SEQS" \
+  --max-model-len "$MAX_MODEL_LEN" \
   --max-num-batched-tokens 4096 \
   --trust-remote-code \
+  --async-scheduling \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
   --no-enable-prefix-caching \
   --gpu-memory-utilization 0.95 \
   --quantization ascend \
-  --dtype bfloat16 \
   --enforce-eager \
   --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}' \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --attention_config.indexer_kv_dtype fp8 \
   --additional_config "$ADDITIONAL_CONFIG" \
   > "$SERVER_LOG" 2>&1 < /dev/null &

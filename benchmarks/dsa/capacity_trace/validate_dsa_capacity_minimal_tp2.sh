@@ -17,10 +17,66 @@ TARGET_LAYER="$(cat "$TRACE_DIR/target_layer.txt")"
 BASE_CAPACITY="$(cat "$TRACE_DIR/base_capacity.txt")"
 TARGET_CAPACITY="$(cat "$TRACE_DIR/target_capacity.txt")"
 SERVER_LOG="$TRACE_DIR/server.log"
+PLOG_DIR="$TRACE_DIR/plog"
 SERVER_TRACE_DIR="$TRACE_DIR/server-trace"
 SERVER_PID="$(cat "$TRACE_DIR/server.pid")"
 
 cd "$REPO"
+
+cleanup_server_tree() {
+  echo "CLEANUP_SERVER_TREE: pid=$SERVER_PID"
+  "$PY" - "$SERVER_PID" <<'PY' || true
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+root = int(sys.argv[1])
+children = {}
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    try:
+        stat = (proc / "stat").read_text()
+        fields = stat[stat.rfind(")") + 2:].split()
+        ppid = int(fields[1])
+        children.setdefault(ppid, []).append(pid)
+    except (OSError, ValueError, IndexError):
+        continue
+
+order = []
+seen = set()
+stack = [root]
+while stack:
+    pid = stack.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    order.append(pid)
+    stack.extend(children.get(pid, []))
+
+for pid in reversed(order):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        print("CLEANUP_PERMISSION_DENIED pid=", pid)
+time.sleep(2)
+for pid in reversed(order):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        print("CLEANUP_PERMISSION_DENIED pid=", pid)
+print("CLEANUP_SIGNALLED_PIDS =", order)
+PY
+}
+
+FATAL_PATTERN='EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\\[4\\]'
 
 echo "===== 1. Wait for service ====="
 echo "TRACE_DIR=$TRACE_DIR"
@@ -31,9 +87,13 @@ echo "TARGET_CAPACITY=$TARGET_CAPACITY"
 
 READY=0
 for I in $(seq 1 120); do
-  if grep -Eq 'EngineCore failed to start|Worker failed with error|ERR00100 PTA call acl api failed' "$SERVER_LOG" 2>/dev/null; then
-    echo "ERROR: fatal engine/worker startup failure detected before API health."
+  if grep -ERiq "$FATAL_PATTERN" "$SERVER_LOG" "$PLOG_DIR" 2>/dev/null; then
+    echo "ERROR: fatal engine/worker/HCCL startup failure detected before API health."
+    echo "===== MATCHING FATAL LOGS ====="
+    grep -ERni "$FATAL_PATTERN" "$SERVER_LOG" "$PLOG_DIR" 2>/dev/null | tail -n 120 || true
+    echo "===== SERVER LOG TAIL ====="
     tail -n 240 "$SERVER_LOG" || true
+    cleanup_server_tree
     exit 7
   fi
   if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -45,6 +105,7 @@ for I in $(seq 1 120); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "ERROR: API server process exited before becoming healthy."
     tail -n 160 "$SERVER_LOG" || true
+    cleanup_server_tree
     exit 3
   fi
   sleep 5
@@ -52,7 +113,10 @@ done
 
 if [ "$READY" -ne 1 ]; then
   echo "ERROR: API server did not become healthy within 10 minutes."
+  echo "===== PLOG ERROR TAIL ====="
+  grep -ERni 'ERROR|already been bound|listen the port|CreateChannels failed' "$PLOG_DIR" 2>/dev/null | tail -n 120 || true
   tail -n 160 "$SERVER_LOG" || true
+  cleanup_server_tree
   exit 4
 fi
 
@@ -62,6 +126,7 @@ if ! grep -F "DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=
   echo "ERROR: did not find the actual per-layer allocation confirmation in server.log."
   echo "Expected: DSA_LAYER_RESIDENT_CAPACITY_ALLOCATED: layer=$TARGET_LAYER tokens=$TARGET_CAPACITY"
   tail -n 200 "$SERVER_LOG" || true
+  cleanup_server_tree
   exit 5
 fi
 grep -F "DSA_LAYER_RESIDENT_CAPACITY" "$SERVER_LOG" | tail -n 20
@@ -81,6 +146,7 @@ else
   RC=$?
   echo "REQUEST_STATUS=FAIL rc=$RC"
   tail -n 200 "$SERVER_LOG" || true
+  cleanup_server_tree
   exit "$RC"
 fi
 
@@ -89,6 +155,7 @@ echo "===== 4. Verify service remains healthy ====="
 if ! curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then
   echo "ERROR: service became unhealthy after the request."
   tail -n 200 "$SERVER_LOG" || true
+  cleanup_server_tree
   exit 6
 fi
 echo "POST_REQUEST_HEALTH=PASS"
