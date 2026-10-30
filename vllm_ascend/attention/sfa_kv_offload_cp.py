@@ -70,10 +70,18 @@ class AscendSFAKVOffloadDSACPMetadataBuilder(
         # the intersection of that shard with the leading global decode range.
         global_decode_tokens = int(metadata.num_decode_tokens)
         local_start = min(max(int(context.local_start), 0), global_decode_tokens)
-        local_end = min(max(int(context.local_end_with_pad), local_start), global_decode_tokens)
+        # local_end excludes CP alignment padding. local_end_with_pad is the
+        # extent of the rank's input tensor, not the number of valid queries.
+        local_end = min(max(int(context.local_end), local_start), global_decode_tokens)
         metadata.num_decode_tokens = local_end - local_start
         if metadata.token_to_req is not None:
-            metadata.token_to_req = metadata.token_to_req[local_start:local_end]
+            local_token_to_req = metadata.token_to_req[local_start:local_end]
+            if local_token_to_req.numel() != metadata.num_decode_tokens:
+                raise RuntimeError(
+                    "DSA-CP Sparse KV token_to_req length does not match local decode rows: "
+                    f"got {local_token_to_req.numel()}, expected {metadata.num_decode_tokens}."
+                )
+            metadata.token_to_req = local_token_to_req
         return metadata
 
 

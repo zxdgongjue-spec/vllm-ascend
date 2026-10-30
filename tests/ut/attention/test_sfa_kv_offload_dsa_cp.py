@@ -50,25 +50,34 @@ def test_sfa_backend_selects_dsa_cp_offload_pair():
 
 
 @pytest.mark.parametrize(
-    ("local_start", "local_end", "expected_tokens", "expected_map"),
+    ("local_start", "local_end", "local_end_with_pad", "expected_tokens", "expected_map"),
     [
-        (0, 2, 2, [0, 1]),
-        (2, 4, 2, [2, 3]),
-        (4, 6, 0, []),
+        (0, 2, 2, 2, [0, 0]),
+        (2, 4, 4, 2, [1, 1]),
+        (4, 4, 6, 0, []),
+        # A rank-local padded row must not be counted as a valid decode token.
+        (2, 3, 4, 1, [1]),
     ],
 )
-def test_dsa_cp_builder_localizes_decode_token_rows(local_start, local_end, expected_tokens, expected_map):
+def test_dsa_cp_builder_localizes_decode_token_rows(
+    local_start, local_end, local_end_with_pad, expected_tokens, expected_map
+):
     builder = AscendSFAKVOffloadDSACPMetadataBuilder.__new__(AscendSFAKVOffloadDSACPMetadataBuilder)
     builder.use_fused_copy_sfa = False
     builder.decode_threshold = 1
     builder.is_pd_decode_consumer = False
     metadata = SimpleNamespace(
         attn_state=AscendAttentionState.DecodeOnly,
-        dsa_cp_context=SimpleNamespace(local_start=local_start, local_end_with_pad=local_end),
+        dsa_cp_context=SimpleNamespace(
+            local_start=local_start,
+            local_end=local_end,
+            local_end_with_pad=local_end_with_pad,
+        ),
     )
     common = SimpleNamespace(
         req_ids_tensor=torch.tensor([10, 11]),
-        token_to_req=torch.tensor([0, 1, 0, 1]),
+        # token_to_req stores request-row indices, not global token indices.
+        token_to_req=torch.tensor([0, 0, 1, 1]),
     )
     with patch(
         "vllm_ascend.attention.sfa_kv_offload.split_decodes_and_prefills",
@@ -80,6 +89,9 @@ def test_dsa_cp_builder_localizes_decode_token_rows(local_start, local_end, expe
     assert metadata.num_prefills == 0
     assert metadata.num_decode_tokens == expected_tokens
     assert metadata.token_to_req.tolist() == expected_map
+    assert metadata.token_to_req.numel() == metadata.num_decode_tokens
+    if metadata.token_to_req.numel():
+        assert bool(((metadata.token_to_req >= 0) & (metadata.token_to_req < 2)).all())
 
 
 def test_dsa_cp_rank_without_local_decode_rows_still_is_decode_only():
