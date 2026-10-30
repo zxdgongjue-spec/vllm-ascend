@@ -31,6 +31,11 @@ echo "TARGET_CAPACITY=$TARGET_CAPACITY"
 
 READY=0
 for I in $(seq 1 120); do
+  if grep -Eq 'EngineCore failed to start|Worker failed with error|ERR00100 PTA call acl api failed' "$SERVER_LOG" 2>/dev/null; then
+    echo "ERROR: fatal engine/worker startup failure detected before API health."
+    tail -n 240 "$SERVER_LOG" || true
+    exit 7
+  fi
   if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     READY=1
     echo "API_SERVER_READY=1"
