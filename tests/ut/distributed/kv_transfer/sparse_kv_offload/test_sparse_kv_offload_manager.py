@@ -454,6 +454,7 @@ def test_topk_buffer_allocator_uses_layer_override(monkeypatch):
     assert other_k.shape == (2, 4096, 1, 512)
     assert other_v.shape == (2, 4096, 1, 64)
 
+
 def test_profile_buffer_allocator_uses_layer_overrides_and_logs_count(monkeypatch):
     target_layers = {
         "model.layers.0.self_attn.attn": 6144,
