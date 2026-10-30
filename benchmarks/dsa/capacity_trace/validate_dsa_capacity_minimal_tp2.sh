@@ -51,7 +51,7 @@ stop_hint() {
   echo "STOP_FOREGROUND_SERVER=Press Ctrl+C in terminal A (the vllm serve terminal)."
 }
 
-FATAL_PATTERN='Traceback (most recent call last)|NotImplementedError:|ERR99999 UNKNOWN|EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\[4\]'
+FATAL_PATTERN='Traceback|NotImplementedError:|ERR99999 UNKNOWN|EngineCore failed to start|Worker failed with error|ERR00100|listen the port [0-9]+ failed|already been bound|HRaSocketListenStart|CreateChannels failed|HcclAllocAlgResourceAiv.*ret\[4\]'
 
 echo "===== 1. Wait for service ====="
 echo "TRACE_DIR=$TRACE_DIR"
